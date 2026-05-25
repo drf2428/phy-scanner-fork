@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  validate:
+    name: Validate fork structure
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify required files exist
+        run: |
+          set -e
+          for f in README.md LICENSE UPSTREAM_CREDITS.md UPSTREAM.md scripts/sync-upstream.sh .gitignore; do
+            if [ ! -f "$f" ]; then
+              echo "ERROR: required file missing: $f"
+              exit 1
+            fi
+            echo "OK: $f"
+          done
+
+      - name: Verify sync-upstream.sh is executable
+        run: |
+          set -e
+          if [ ! -x scripts/sync-upstream.sh ]; then
+            echo "ERROR: scripts/sync-upstream.sh is not executable"
+            exit 1
+          fi
+          echo "OK: sync-upstream.sh is executable"
+
+      - name: Lint sync-upstream.sh with shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck scripts/sync-upstream.sh
+
+      - name: Dry-run sync-upstream.sh
+        run: |
+          DRY_RUN=1 ./scripts/sync-upstream.sh
+          echo "Dry run completed successfully"
+
+      - name: Confirm LICENSE is GPL-2.0
+        run: |
+          set -e
+          if ! grep -q "GNU GENERAL PUBLIC LICENSE" LICENSE; then
+            echo "ERROR: LICENSE does not appear to be GPL"
+            exit 1
+          fi
+          if ! grep -q "Version 2" LICENSE; then
+            echo "ERROR: LICENSE is not GPL Version 2"
+            exit 1
+          fi
+          echo "OK: LICENSE is GPL v2"
