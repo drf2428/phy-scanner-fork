@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    branches: [main, 'claude/**', 'feature/**', 'fix/**']
   pull_request:
   workflow_dispatch:
 
@@ -43,6 +44,13 @@ jobs:
         run: |
           DRY_RUN=1 ./scripts/sync-upstream.sh
           echo "Dry run completed successfully"
+
+      - name: Check required compliance files
+        run: |
+          for f in oss-disclosures.md SECURITY.md CONTRIBUTING.md LICENSE; do
+            [ -f "$f" ] || { echo "MISSING: $f"; exit 1; }
+          done
+          echo "All required compliance files present"
 
       - name: Confirm LICENSE is GPL-2.0
         run: |
