@@ -1,0 +1,18 @@
+[Unit]
+Description=Physeter Scanner Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=phy-scanner
+EnvironmentFile=/etc/phy-scanner/config.env
+WorkingDirectory=/opt/phy-scanner
+ExecStart=/usr/bin/python3 -m agent.main
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

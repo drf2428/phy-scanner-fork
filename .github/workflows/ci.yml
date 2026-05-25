@@ -2,9 +2,8 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'claude/**', 'feature/**', 'fix/**']
   pull_request:
-    branches: [main]
   workflow_dispatch:
 
 jobs:
@@ -46,6 +45,13 @@ jobs:
           DRY_RUN=1 ./scripts/sync-upstream.sh
           echo "Dry run completed successfully"
 
+      - name: Check required compliance files
+        run: |
+          for f in oss-disclosures.md SECURITY.md CONTRIBUTING.md LICENSE; do
+            [ -f "$f" ] || { echo "MISSING: $f"; exit 1; }
+          done
+          echo "All required compliance files present"
+
       - name: Confirm LICENSE is GPL-2.0
         run: |
           set -e
@@ -58,3 +64,25 @@ jobs:
             exit 1
           fi
           echo "OK: LICENSE is GPL v2"
+
+  test:
+    name: Run agent tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install -r agent/requirements.txt
+          pip install pytest pytest-asyncio
+
+      - name: Run tests
+        run: python3 -m pytest tests/ -v
