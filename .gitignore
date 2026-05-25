@@ -1,0 +1,20 @@
+# Build artifacts and upstream sources (downloaded on demand)
+build/
+*.o
+*.so
+*.dylib
+*.a
+*.exe
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
