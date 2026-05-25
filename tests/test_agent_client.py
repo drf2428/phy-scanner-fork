@@ -74,6 +74,7 @@ async def test_submit_result_success(monkeypatch):
         assert request.url.path == "/agent/result"
         body = json.loads(request.content)
         assert body["job_id"] == "abc123"
+        assert body["finding_count"] == 1
         return httpx.Response(200, json=ack_payload)
 
     client = PhyClient(_make_config())
