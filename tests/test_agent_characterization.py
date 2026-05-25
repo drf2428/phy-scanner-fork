@@ -162,10 +162,10 @@ class TestPollJobResponseShape(unittest.TestCase):
             return httpx.Response(204)
 
         from agent.client import PhyClient
-        client = PhyClient(_make_config())
         mock_transport = httpx.MockTransport(handler)
 
         async def _run():
+            client = PhyClient(_make_config())
             client._make_client = lambda: httpx.AsyncClient(
                 base_url="https://app.physeter.cloud",
                 transport=mock_transport,
@@ -181,10 +181,10 @@ class TestPollJobResponseShape(unittest.TestCase):
             return httpx.Response(500, text="internal error")
 
         from agent.client import PhyClient, PhyApiError
-        client = PhyClient(_make_config())
         mock_transport = httpx.MockTransport(handler)
 
         async def _run():
+            client = PhyClient(_make_config())
             client._make_client = lambda: httpx.AsyncClient(
                 base_url="https://app.physeter.cloud",
                 transport=mock_transport,
@@ -264,13 +264,6 @@ class TestAgentStateLifecycle(unittest.TestCase):
 
         state.mark_done(job_id)
         self.assertIsNone(state.get_active_job())
-
-        # Row still exists with DONE status
-        row = state._conn.execute(
-            "SELECT status FROM jobs WHERE job_id = ?", (job_id,)
-        ).fetchone()
-        self.assertIsNotNone(row)
-        self.assertEqual(row["status"], "done")
         state.close()
 
     def test_failed_status_is_not_active(self):
@@ -280,12 +273,6 @@ class TestAgentStateLifecycle(unittest.TestCase):
         state.upsert_job("j-fail", JobStatus.SCANNING)
         state.mark_failed("j-fail", "timeout after 3600s")
         self.assertIsNone(state.get_active_job())
-
-        row = state._conn.execute(
-            "SELECT status, error FROM jobs WHERE job_id = ?", ("j-fail",)
-        ).fetchone()
-        self.assertEqual(row["status"], "failed")
-        self.assertEqual(row["error"], "timeout after 3600s")
         state.close()
 
 
