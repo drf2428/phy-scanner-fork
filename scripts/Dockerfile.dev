@@ -1,0 +1,19 @@
+# Dockerfile.dev — Development/testing image for the Physeter Scanner agent
+# NOT for production — use the OVA for production deployments
+FROM python:3.11-slim
+
+WORKDIR /opt/phy-scanner
+
+COPY agent/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY agent/ ./agent/
+
+ENV PHY_API_URL=""
+ENV PHY_TOKEN=""
+ENV PHY_LOG_LEVEL="INFO"
+ENV PHY_DATA_DIR="/var/lib/phy-scanner"
+
+RUN mkdir -p /var/lib/phy-scanner
+
+ENTRYPOINT ["python3", "-m", "agent.main"]
