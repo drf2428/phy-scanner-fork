@@ -59,6 +59,7 @@ class PhyClient:
         payload: dict[str, Any] = {
             "job_id": job_id,
             "findings": findings,
+            "finding_count": len(findings),
             "raw_report_s3_key": raw_report_s3_key,
             "host_count": host_count,
             "started_at": started_at,
@@ -74,14 +75,15 @@ class PhyClient:
         self,
         job_id: Optional[str] = None,
         progress_pct: float = 0.0,
-        status: str = "idle",
         disk_free_gb: float = 0.0,
         ram_used_pct: float = 0.0,
     ) -> None:
         """POST /agent/heartbeat. 204 expected."""
         payload: dict[str, Any] = {
             "appliance_version": self._config.appliance_version,
-            "status": status,
+            "appliance_os": self._config.appliance_os,
+            "feed_version_nvt": self._config.feed_version_nvt,
+            "feed_version_scap": self._config.feed_version_scap,
             "progress_pct": progress_pct,
             "disk_free_gb": disk_free_gb,
             "ram_used_pct": ram_used_pct,
@@ -127,7 +129,7 @@ class PhyClient:
                 resp = await client.get("/agent/upload-url", params={"job_id": job_id})
                 if resp.status_code == 200:
                     data = resp.json()
-                    return data["url"], data["s3_key"]
+                    return data["upload_url"], data["upload_s3_key"]
                 logger.warning("get_upload_url unexpected status %s", resp.status_code)
                 return None
         except Exception as exc:  # noqa: BLE001

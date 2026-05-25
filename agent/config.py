@@ -1,6 +1,7 @@
 """Agent configuration — loaded from environment or /etc/phy-scanner/config.env."""
 import os
-from dataclasses import dataclass
+import platform
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -12,6 +13,9 @@ class AgentConfig:
     appliance_version: str  # PHY_APPLIANCE_VERSION default "0.1.0"
     log_level: str         # PHY_LOG_LEVEL default "INFO"
     data_dir: str          # PHY_DATA_DIR default "/var/lib/phy-scanner"
+    appliance_os: str = field(default_factory=platform.platform)  # OS identifier
+    feed_version_nvt: str = "stub"   # PHY_FEED_VERSION_NVT
+    feed_version_scap: str = "stub"  # PHY_FEED_VERSION_SCAP
 
 
 def load_config() -> AgentConfig:
@@ -37,6 +41,8 @@ def load_config() -> AgentConfig:
     appliance_version = os.environ.get("PHY_APPLIANCE_VERSION", "0.1.0")
     log_level = os.environ.get("PHY_LOG_LEVEL", "INFO").upper()
     data_dir = os.environ.get("PHY_DATA_DIR", "/var/lib/phy-scanner")
+    feed_version_nvt = os.environ.get("PHY_FEED_VERSION_NVT", "stub")
+    feed_version_scap = os.environ.get("PHY_FEED_VERSION_SCAP", "stub")
 
     return AgentConfig(
         api_url=api_url.rstrip("/"),
@@ -46,4 +52,6 @@ def load_config() -> AgentConfig:
         appliance_version=appliance_version,
         log_level=log_level,
         data_dir=data_dir,
+        feed_version_nvt=feed_version_nvt,
+        feed_version_scap=feed_version_scap,
     )

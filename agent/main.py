@@ -72,7 +72,7 @@ async def _run_job(
 
     # Transition: claimed -> scanning
     state.upsert_job(job_id, JobStatus.SCANNING)
-    await client.send_heartbeat(job_id=job_id, status="scanning", progress_pct=0.0)
+    await client.send_heartbeat(job_id=job_id, progress_pct=0.0)
 
     try:
         result = await run_scan(job, config)
@@ -82,7 +82,7 @@ async def _run_job(
         await client.send_log("error", f"Scan failed: {exc}", {"job_id": job_id})
         return
 
-    await client.send_heartbeat(job_id=job_id, status="uploading", progress_pct=80.0)
+    await client.send_heartbeat(job_id=job_id, progress_pct=80.0)
 
     # Transition: scanning -> uploading
     state.upsert_job(job_id, JobStatus.UPLOADING)
@@ -104,7 +104,7 @@ async def _run_job(
 
     # Transition: uploading -> submitting
     state.upsert_job(job_id, JobStatus.SUBMITTING)
-    await client.send_heartbeat(job_id=job_id, status="submitting", progress_pct=95.0)
+    await client.send_heartbeat(job_id=job_id, progress_pct=95.0)
 
     try:
         ack = await client.submit_result(
@@ -117,7 +117,7 @@ async def _run_job(
         )
         logger.info("Job submitted successfully job_id=%s ack=%s", job_id, ack)
         state.mark_done(job_id)
-        await client.send_heartbeat(job_id=job_id, status="idle", progress_pct=100.0)
+        await client.send_heartbeat(job_id=job_id, progress_pct=100.0)
     except PhyApiError as exc:
         logger.error("submit_result failed for job_id=%s: %s", job_id, exc)
         state.mark_failed(job_id, str(exc))
@@ -168,15 +168,13 @@ async def _heartbeat_loop(
     while not stop_event.is_set():
         active = state.get_active_job()
         job_id = active.get("job_id") if active else None
-        status = active.get("status", "idle") if active else "idle"
         try:
             await client.send_heartbeat(
                 job_id=job_id,
-                status=status,
                 disk_free_gb=_disk_free_gb(),
                 ram_used_pct=_ram_used_pct(),
             )
-            logger.debug("Heartbeat sent job_id=%s status=%s", job_id, status)
+            logger.debug("Heartbeat sent job_id=%s", job_id)
         except Exception as exc:
             logger.warning("Heartbeat send failed (non-fatal): %s", exc)
 

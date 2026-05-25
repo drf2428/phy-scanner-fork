@@ -107,7 +107,30 @@ async def test_heartbeat_204(monkeypatch):
     ))
 
     # Should complete without raising
-    await client.send_heartbeat(job_id=None, status="idle")
+    await client.send_heartbeat(job_id=None)
+
+
+@pytest.mark.asyncio
+async def test_get_upload_url_returns_tuple(monkeypatch):
+    """GET /agent/upload-url 200 returns (upload_url, upload_s3_key) tuple."""
+    mock_body = {
+        "upload_url": "https://s3.example.com/key",
+        "upload_s3_key": "raw/tenant/job.xml",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/agent/upload-url"
+        assert request.url.params["job_id"] == "abc123"
+        return httpx.Response(200, json=mock_body)
+
+    client = PhyClient(_make_config())
+    monkeypatch.setattr(client, "_make_client", lambda: httpx.AsyncClient(
+        base_url="https://app.physeter.cloud",
+        transport=httpx.MockTransport(handler),
+    ))
+
+    result = await client.get_upload_url("abc123")
+    assert result == ("https://s3.example.com/key", "raw/tenant/job.xml")
 
 
 @pytest.mark.asyncio
