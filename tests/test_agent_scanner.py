@@ -277,6 +277,296 @@ def test_parse_nmap_malformed_xml_returns_empty():
 
 
 # ---------------------------------------------------------------------------
+# smb-os-discovery parsing
+# ---------------------------------------------------------------------------
+
+# Fixture: host with smb-os-discovery hostscript output (Computer Name + OS).
+_NMAP_XML_WITH_SMB = """<?xml version="1.0" encoding="UTF-8"?>
+<nmaprun scanner="nmap" args="nmap -sV --open -T4 -Pn --script=smb-os-discovery 10.0.1.5">
+  <host>
+    <status state="up"/>
+    <address addr="10.0.1.5" addrtype="ipv4"/>
+    <hostnames/>
+    <ports>
+      <port protocol="tcp" portid="445">
+        <state state="open"/>
+        <service name="microsoft-ds" product="Samba smbd" version="4.x"/>
+      </port>
+      <port protocol="tcp" portid="139">
+        <state state="open"/>
+        <service name="netbios-ssn" product="Samba smbd" version="3.x-4.x"/>
+      </port>
+    </ports>
+    <hostscript>
+      <script id="smb-os-discovery" output="OS: Windows 10 Pro; Computer Name: FILESERVER01">
+        <elem key="OS">Windows 10 Pro</elem>
+        <elem key="Computer Name">FILESERVER01</elem>
+        <elem key="Domain Name">lab.internal</elem>
+        <elem key="FQDN">FILESERVER01.lab.internal</elem>
+      </script>
+    </hostscript>
+  </host>
+</nmaprun>
+"""
+
+# Fixture: host WITHOUT smb-os-discovery (should behave exactly as before).
+_NMAP_XML_NO_SMB = """<?xml version="1.0" encoding="UTF-8"?>
+<nmaprun scanner="nmap" args="nmap -sV --open -T4 -Pn --script=smb-os-discovery 10.0.1.6">
+  <host>
+    <status state="up"/>
+    <address addr="10.0.1.6" addrtype="ipv4"/>
+    <hostnames>
+      <hostname name="db01.corp.example" type="PTR"/>
+    </hostnames>
+    <ports>
+      <port protocol="tcp" portid="445">
+        <state state="open"/>
+        <service name="microsoft-ds" product="Samba smbd" version="4.x"/>
+      </port>
+    </ports>
+  </host>
+</nmaprun>
+"""
+
+# Fixture: host with the alternate key name "NetBIOS computer name".
+_NMAP_XML_NETBIOS_KEY = """<?xml version="1.0" encoding="UTF-8"?>
+<nmaprun scanner="nmap" args="nmap -sV --open -T4 -Pn --script=smb-os-discovery 10.0.1.7">
+  <host>
+    <status state="up"/>
+    <address addr="10.0.1.7" addrtype="ipv4"/>
+    <hostnames/>
+    <ports>
+      <port protocol="tcp" portid="139">
+        <state state="open"/>
+        <service name="netbios-ssn" product="Samba smbd" version="3.x"/>
+      </port>
+    </ports>
+    <hostscript>
+      <script id="smb-os-discovery" output="NetBIOS computer name: LEGACYBOX">
+        <elem key="NetBIOS computer name">LEGACYBOX</elem>
+        <elem key="OS">Windows Server 2003</elem>
+      </script>
+    </hostscript>
+  </host>
+</nmaprun>
+"""
+
+
+def test_parse_nmap_smb_computer_name_overrides_hostname():
+    """smb-os-discovery Computer Name is used as hostname (higher quality)."""
+    findings = parse_nmap(_NMAP_XML_WITH_SMB)
+    assert findings, "expected at least one finding for host with open 445/139"
+    for f in findings:
+        assert f["host"] == "10.0.1.5"
+        assert f["hostname"] == "FILESERVER01", (
+            f"expected SMB computer name 'FILESERVER01', got {f['hostname']!r}"
+        )
+
+
+def test_parse_nmap_smb_os_appended_to_evidence():
+    """smb-os-discovery OS is appended to finding evidence; shape stays stable."""
+    findings = parse_nmap(_NMAP_XML_WITH_SMB)
+    assert findings
+    for f in findings:
+        assert "OS: Windows 10 Pro (smb-os-discovery)" in f["evidence"], (
+            f"expected OS annotation in evidence, got: {f['evidence']!r}"
+        )
+    # Shape stays stable — no new top-level field.
+    allowed = {
+        "host", "hostname", "port", "protocol", "severity",
+        "cvss_score", "cve_id", "cve_ids", "nvt_oid", "detector_signature",
+        "title", "description", "solution", "evidence", "references",
+    }
+    for f in findings:
+        extra = set(f.keys()) - allowed
+        assert extra == set(), f"emits keys outside FindingPayload: {extra}"
+
+
+def test_parse_nmap_no_smb_output_behaves_as_before():
+    """Hosts without smb-os-discovery output are unaffected (no crash, DNS hostname kept)."""
+    findings = parse_nmap(_NMAP_XML_NO_SMB)
+    assert len(findings) == 1
+    f = findings[0]
+    assert f["host"] == "10.0.1.6"
+    # Hostname should come from reverse-DNS / hostnames element (short name).
+    assert f["hostname"] == "db01", (
+        f"expected DNS short name 'db01' without SMB, got {f['hostname']!r}"
+    )
+    # No OS annotation in evidence.
+    assert "smb-os-discovery" not in f["evidence"]
+
+
+def test_parse_nmap_smb_netbios_key_alternate_name():
+    """'NetBIOS computer name' key (alternate spelling) is accepted as hostname."""
+    findings = parse_nmap(_NMAP_XML_NETBIOS_KEY)
+    assert findings
+    for f in findings:
+        assert f["hostname"] == "LEGACYBOX"
+        assert "OS: Windows Server 2003 (smb-os-discovery)" in f["evidence"]
+
+
+def test_sanitize_smb_field_strips_full_control_range_and_bounds():
+    """Unit: _sanitize_smb_field strips the FULL C0/C1-ish + DEL range (incl.
+    NUL, BEL, ESC — bytes that XML itself forbids but could arrive via any
+    future non-XML path) and caps length; empty-after-strip -> None."""
+    # Every control byte in [0x00, 0x1f] plus DEL, interleaved with printables.
+    evil = "A" + "".join(chr(c) for c in range(0x00, 0x20)) + "\x7f" + "B"
+    out = scanner._sanitize_smb_field(evil, 255)
+    assert out == "AB", f"control chars not fully stripped: {out!r}"
+
+    # Length bound is enforced.
+    long_clean = "C" * 10000
+    assert scanner._sanitize_smb_field(long_clean, 255) == "C" * 255
+    assert scanner._sanitize_smb_field("D" * 10000, 256) == "D" * 256
+
+    # All-control-chars / empty / None -> None (caller falls back).
+    assert scanner._sanitize_smb_field("\x00\x07\x1b\x7f", 255) is None
+    assert scanner._sanitize_smb_field("   ", 255) is None
+    assert scanner._sanitize_smb_field("", 255) is None
+    assert scanner._sanitize_smb_field(None, 255) is None
+
+
+def test_parse_nmap_smb_fields_sanitized_and_bounded():
+    """A hostile target controls smb-os-discovery elem text — it must be
+    control-char-stripped + length-bounded before becoming hostname/evidence.
+
+    Uses the control chars that are VALID in XML 1.0 text (TAB/LF/CR/DEL) — the
+    exact newline/whitespace-injection vectors that could forge extra evidence
+    lines — since those are what actually reach parse_nmap through the XML layer.
+    """
+    # ~10k-char computer name with embedded newline / CR / tab / DEL, and a
+    # malicious OS string trying to inject a newline + a forged extra line.
+    evil_name = "EVIL\tBOX\n\rPWN\x7f" + ("A" * 10000)
+    evil_os = "Linux\nInjected: critical\r\t" + ("B" * 5000)
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<nmaprun scanner="nmap" args="nmap -sV --open -T4 -Pn --script=smb-os-discovery 10.0.2.9">
+  <host>
+    <status state="up"/>
+    <address addr="10.0.2.9" addrtype="ipv4"/>
+    <hostnames/>
+    <ports>
+      <port protocol="tcp" portid="445">
+        <state state="open"/>
+        <service name="microsoft-ds" product="Samba smbd" version="4.x"/>
+      </port>
+    </ports>
+    <hostscript>
+      <script id="smb-os-discovery">
+        <elem key="Computer Name">{evil_name}</elem>
+        <elem key="OS">{evil_os}</elem>
+      </script>
+    </hostscript>
+  </host>
+</nmaprun>
+"""
+    findings = parse_nmap(xml)
+    assert len(findings) == 1
+    f = findings[0]
+
+    # Hostname is bounded at 255 and contains no control chars / newlines.
+    hn = f["hostname"]
+    assert hn is not None
+    assert len(hn) <= 255, f"hostname not bounded: len={len(hn)}"
+    assert "\n" not in hn and "\r" not in hn and "\t" not in hn and "\x7f" not in hn
+    # The control chars are stripped, leaving the surrounding printable text glued.
+    assert hn.startswith("EVILBOX")
+    assert "PWN" in hn
+
+    # OS annotation is present but bounded + stripped; it cannot inject a newline
+    # (which would forge a second evidence line) nor other control bytes.
+    ev = f["evidence"]
+    assert "(smb-os-discovery)" in ev
+    assert "\n" not in ev and "\r" not in ev and "\t" not in ev and "\x7f" not in ev
+    # The bounded OS substring (<=256) sits inside the single-line evidence.
+    assert "OS: Linux" in ev
+    # Evidence stays a single logical line (no injected extra lines).
+    assert ev.count("\n") == 0
+
+    # Shape stays stable — no new top-level field from the hostile input.
+    allowed = {
+        "host", "hostname", "port", "protocol", "severity",
+        "cvss_score", "cve_id", "cve_ids", "nvt_oid", "detector_signature",
+        "title", "description", "solution", "evidence", "references",
+    }
+    assert set(f.keys()) - allowed == set()
+
+
+def test_parse_nmap_smb_name_all_control_chars_falls_back():
+    """A computer name that is ALL (XML-valid) control chars sanitizes to empty
+    -> None -> fall back to the existing reverse-DNS hostname (no empty
+    hostname, §50: absent/unusable smb output behaves as today)."""
+    # TAB/LF/CR/DEL are valid in XML 1.0 text but all stripped by the sanitizer.
+    xml = """<?xml version="1.0" encoding="UTF-8"?>
+<nmaprun scanner="nmap" args="nmap -sV --open -T4 -Pn --script=smb-os-discovery 10.0.2.10">
+  <host>
+    <status state="up"/>
+    <address addr="10.0.2.10" addrtype="ipv4"/>
+    <hostnames>
+      <hostname name="realdns.corp.example" type="PTR"/>
+    </hostnames>
+    <ports>
+      <port protocol="tcp" portid="445">
+        <state state="open"/>
+        <service name="microsoft-ds" product="Samba smbd" version="4.x"/>
+      </port>
+    </ports>
+    <hostscript>
+      <script id="smb-os-discovery">
+        <elem key="Computer Name">\t\r\x7f</elem>
+      </script>
+    </hostscript>
+  </host>
+</nmaprun>
+"""
+    findings = parse_nmap(xml)
+    assert len(findings) == 1
+    f = findings[0]
+    # SMB name was all control chars -> dropped -> DNS short name kept.
+    assert f["hostname"] == "realdns", (
+        f"expected fallback to DNS short name, got {f['hostname']!r}"
+    )
+    # No OS elem -> no OS annotation.
+    assert "smb-os-discovery" not in f["evidence"]
+
+
+def test_run_scan_script_arg_present_and_scope_unchanged(monkeypatch):
+    """--script=smb-os-discovery is in nmap argv; filter_scope behaviour is unaffected."""
+    captured_argv = {}
+
+    async def fake_exec(*cmd, **kwargs):
+        captured_argv["cmd"] = cmd
+        return _FakeProc(_NMAP_XML_WITH_SMB.encode())
+
+    monkeypatch.setattr(scanner.asyncio, "create_subprocess_exec", fake_exec)
+
+    job = {"job_id": "job-smb", "target_scope": "10.0.1.5"}
+    result = asyncio.run(run_scan(job, _Cfg(), cidrs_allowed=["10.0.1.0/24"]))
+
+    cmd = captured_argv["cmd"]
+    assert "--script=smb-os-discovery" in cmd
+    # The -- separator still precedes targets; no target looks like a flag.
+    sep = cmd.index("--")
+    assert all(not t.startswith("-") for t in cmd[sep + 1:])
+    # Only in-scope target was passed to nmap.
+    assert "10.0.1.5/32" in cmd
+    # Findings populated (445 + 139 both open).
+    assert len(result.findings) == 2
+    assert result.kept_targets == ["10.0.1.5/32"]
+    if result.raw_report_path:
+        import os
+        os.unlink(result.raw_report_path)
+
+
+def test_filter_scope_unchanged_by_smb_script():
+    """Adding smb-os-discovery to _run_nmap does NOT alter filter_scope behaviour."""
+    # Out-of-scope targets still dropped — scope control is independent of NSE.
+    assert filter_scope("8.8.8.8", ["10.0.0.0/24"]) == []
+    assert filter_scope("10.0.0.5", ["10.0.0.0/24"]) == ["10.0.0.5/32"]
+    # cidrs_allowed=None still fails closed.
+    assert filter_scope("10.0.0.5", None) == []
+
+
+# ---------------------------------------------------------------------------
 # run_scan — nmap mocked
 # ---------------------------------------------------------------------------
 
@@ -320,16 +610,24 @@ def test_run_scan_with_mocked_nmap(monkeypatch):
         assert "<nmaprun" in fh.read()
     os.unlink(result.raw_report_path)
 
-    # nmap invoked with the Mode-1 flags, then -oX - -- , then ONLY in-scope targets.
+    # nmap invoked with the Mode-1 flags + safe discovery script, then -oX - -- ,
+    # then ONLY in-scope targets.
     cmd = captured_argv["cmd"]
-    assert cmd[:8] == ("nmap", "-sV", "--open", "-T4", "-Pn", "-oX", "-", "--")
-    assert cmd[8:] == ("10.0.0.5/32", "10.0.0.6/32")
+    assert cmd[:9] == (
+        "nmap", "-sV", "--open", "-T4", "-Pn",
+        "--script=smb-os-discovery",
+        "-oX", "-", "--",
+    )
+    assert cmd[9:] == ("10.0.0.5/32", "10.0.0.6/32")
     # The -- end-of-options separator precedes every target.
     sep = cmd.index("--")
     assert all(not t.startswith("-") for t in cmd[sep + 1:])
-    # No exploitation / scripting flags.
+    # No exploitation / aggressive flags; only the ONE safe discovery script.
     assert "-A" not in cmd
-    assert "--script" not in cmd
+    assert "--script=smb-os-discovery" in cmd
+    # Confirm no other --script flag is present (only the safe one above).
+    extra_scripts = [a for a in cmd if a.startswith("--script") and a != "--script=smb-os-discovery"]
+    assert extra_scripts == [], f"unexpected --script flags: {extra_scripts}"
 
 
 def test_run_scan_filter_drops_out_of_scope_targets(monkeypatch):
