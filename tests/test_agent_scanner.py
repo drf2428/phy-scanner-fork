@@ -405,6 +405,130 @@ def test_parse_nmap_smb_netbios_key_alternate_name():
         assert "OS: Windows Server 2003 (smb-os-discovery)" in f["evidence"]
 
 
+def test_sanitize_smb_field_strips_full_control_range_and_bounds():
+    """Unit: _sanitize_smb_field strips the FULL C0/C1-ish + DEL range (incl.
+    NUL, BEL, ESC — bytes that XML itself forbids but could arrive via any
+    future non-XML path) and caps length; empty-after-strip -> None."""
+    # Every control byte in [0x00, 0x1f] plus DEL, interleaved with printables.
+    evil = "A" + "".join(chr(c) for c in range(0x00, 0x20)) + "\x7f" + "B"
+    out = scanner._sanitize_smb_field(evil, 255)
+    assert out == "AB", f"control chars not fully stripped: {out!r}"
+
+    # Length bound is enforced.
+    long_clean = "C" * 10000
+    assert scanner._sanitize_smb_field(long_clean, 255) == "C" * 255
+    assert scanner._sanitize_smb_field("D" * 10000, 256) == "D" * 256
+
+    # All-control-chars / empty / None -> None (caller falls back).
+    assert scanner._sanitize_smb_field("\x00\x07\x1b\x7f", 255) is None
+    assert scanner._sanitize_smb_field("   ", 255) is None
+    assert scanner._sanitize_smb_field("", 255) is None
+    assert scanner._sanitize_smb_field(None, 255) is None
+
+
+def test_parse_nmap_smb_fields_sanitized_and_bounded():
+    """A hostile target controls smb-os-discovery elem text — it must be
+    control-char-stripped + length-bounded before becoming hostname/evidence.
+
+    Uses the control chars that are VALID in XML 1.0 text (TAB/LF/CR/DEL) — the
+    exact newline/whitespace-injection vectors that could forge extra evidence
+    lines — since those are what actually reach parse_nmap through the XML layer.
+    """
+    # ~10k-char computer name with embedded newline / CR / tab / DEL, and a
+    # malicious OS string trying to inject a newline + a forged extra line.
+    evil_name = "EVIL\tBOX\n\rPWN\x7f" + ("A" * 10000)
+    evil_os = "Linux\nInjected: critical\r\t" + ("B" * 5000)
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<nmaprun scanner="nmap" args="nmap -sV --open -T4 -Pn --script=smb-os-discovery 10.0.2.9">
+  <host>
+    <status state="up"/>
+    <address addr="10.0.2.9" addrtype="ipv4"/>
+    <hostnames/>
+    <ports>
+      <port protocol="tcp" portid="445">
+        <state state="open"/>
+        <service name="microsoft-ds" product="Samba smbd" version="4.x"/>
+      </port>
+    </ports>
+    <hostscript>
+      <script id="smb-os-discovery">
+        <elem key="Computer Name">{evil_name}</elem>
+        <elem key="OS">{evil_os}</elem>
+      </script>
+    </hostscript>
+  </host>
+</nmaprun>
+"""
+    findings = parse_nmap(xml)
+    assert len(findings) == 1
+    f = findings[0]
+
+    # Hostname is bounded at 255 and contains no control chars / newlines.
+    hn = f["hostname"]
+    assert hn is not None
+    assert len(hn) <= 255, f"hostname not bounded: len={len(hn)}"
+    assert "\n" not in hn and "\r" not in hn and "\t" not in hn and "\x7f" not in hn
+    # The control chars are stripped, leaving the surrounding printable text glued.
+    assert hn.startswith("EVILBOX")
+    assert "PWN" in hn
+
+    # OS annotation is present but bounded + stripped; it cannot inject a newline
+    # (which would forge a second evidence line) nor other control bytes.
+    ev = f["evidence"]
+    assert "(smb-os-discovery)" in ev
+    assert "\n" not in ev and "\r" not in ev and "\t" not in ev and "\x7f" not in ev
+    # The bounded OS substring (<=256) sits inside the single-line evidence.
+    assert "OS: Linux" in ev
+    # Evidence stays a single logical line (no injected extra lines).
+    assert ev.count("\n") == 0
+
+    # Shape stays stable — no new top-level field from the hostile input.
+    allowed = {
+        "host", "hostname", "port", "protocol", "severity",
+        "cvss_score", "cve_id", "cve_ids", "nvt_oid", "detector_signature",
+        "title", "description", "solution", "evidence", "references",
+    }
+    assert set(f.keys()) - allowed == set()
+
+
+def test_parse_nmap_smb_name_all_control_chars_falls_back():
+    """A computer name that is ALL (XML-valid) control chars sanitizes to empty
+    -> None -> fall back to the existing reverse-DNS hostname (no empty
+    hostname, §50: absent/unusable smb output behaves as today)."""
+    # TAB/LF/CR/DEL are valid in XML 1.0 text but all stripped by the sanitizer.
+    xml = """<?xml version="1.0" encoding="UTF-8"?>
+<nmaprun scanner="nmap" args="nmap -sV --open -T4 -Pn --script=smb-os-discovery 10.0.2.10">
+  <host>
+    <status state="up"/>
+    <address addr="10.0.2.10" addrtype="ipv4"/>
+    <hostnames>
+      <hostname name="realdns.corp.example" type="PTR"/>
+    </hostnames>
+    <ports>
+      <port protocol="tcp" portid="445">
+        <state state="open"/>
+        <service name="microsoft-ds" product="Samba smbd" version="4.x"/>
+      </port>
+    </ports>
+    <hostscript>
+      <script id="smb-os-discovery">
+        <elem key="Computer Name">\t\r\x7f</elem>
+      </script>
+    </hostscript>
+  </host>
+</nmaprun>
+"""
+    findings = parse_nmap(xml)
+    assert len(findings) == 1
+    f = findings[0]
+    # SMB name was all control chars -> dropped -> DNS short name kept.
+    assert f["hostname"] == "realdns", (
+        f"expected fallback to DNS short name, got {f['hostname']!r}"
+    )
+    # No OS elem -> no OS annotation.
+    assert "smb-os-discovery" not in f["evidence"]
+
+
 def test_run_scan_script_arg_present_and_scope_unchanged(monkeypatch):
     """--script=smb-os-discovery is in nmap argv; filter_scope behaviour is unaffected."""
     captured_argv = {}

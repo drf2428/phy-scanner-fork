@@ -24,6 +24,7 @@ import asyncio
 import ipaddress
 import logging
 import os
+import re
 import socket
 import tempfile
 import xml.etree.ElementTree as ET
@@ -240,11 +241,40 @@ def filter_scope(
     return kept
 
 
+# smb-os-discovery elem values are FULLY attacker-controlled: a rogue or
+# compromised scan target controls the SMB negotiate response that the script
+# reads. We sanitize and bound them at the trust boundary (this module) before
+# they flow into the finding hostname / evidence — defense-in-depth on top of
+# the backend's own truncation + parameterized INSERT. Strip C0/C1-ish control
+# chars + DEL (incl. NUL/newlines so nothing can inject extra lines/garbage).
+_SMB_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+# Hostname cap mirrors the backend column bound (hostname[:255]).
+_SMB_NAME_MAX = 255
+# OS string is annotated into evidence text only; bound it independently.
+_SMB_OS_MAX = 256
+
+
+def _sanitize_smb_field(value: Optional[str], max_len: int) -> Optional[str]:
+    """Strip control chars/newlines/NUL from an attacker-controlled SMB value
+    and cap its length. Returns None when empty after stripping (so callers
+    fall back to existing behaviour rather than using an empty string)."""
+    if not value:
+        return None
+    cleaned = _SMB_CONTROL_CHARS.sub("", value).strip()[:max_len]
+    return cleaned or None
+
+
 def _extract_smb_os_discovery(host: "ET.Element") -> tuple[Optional[str], Optional[str]]:
     """Extract (computer_name, os_string) from smb-os-discovery hostscript output.
 
     Returns (None, None) when the script did not run or produced no output —
     callers must treat absence as a no-op (§50: absent → do not fabricate).
+
+    Both values are attacker-controlled (the scan target supplies them), so each
+    is sanitized (control chars/newlines/NUL stripped) and length-bounded before
+    return. A field that is empty after sanitization is returned as None so the
+    caller falls back to its existing logic.
 
     Handles both key names emitted by different nmap/script versions:
       - ``Computer Name`` (common) or ``NetBIOS computer name`` (alternate).
@@ -262,7 +292,10 @@ def _extract_smb_os_discovery(host: "ET.Element") -> tuple[Optional[str], Option
                 computer_name = val
             elif key == "OS":
                 os_string = val
-        return computer_name, os_string
+        return (
+            _sanitize_smb_field(computer_name, _SMB_NAME_MAX),
+            _sanitize_smb_field(os_string, _SMB_OS_MAX),
+        )
     return None, None
 
 
