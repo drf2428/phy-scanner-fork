@@ -74,13 +74,41 @@ async def _run_job(
     state.upsert_job(job_id, JobStatus.SCANNING)
     await client.send_heartbeat(job_id=job_id, progress_pct=0.0)
 
+    # Fetch the tenant CIDR allowlist. The §51/legal control FAILS CLOSED:
+    #   - fetch EXCEPTION       -> cidrs_allowed stays None -> filter_scope scans
+    #                              NOTHING (better no scan than an unauthorized one).
+    #   - fetch SUCCESS, []     -> tenant has no allowlist -> filter_scope restricts
+    #                              to RFC1918 private space (never public IPs).
+    #   - fetch SUCCESS, [..]   -> intersect with the validated allowlist.
+    # None therefore means "scope unavailable", distinct from [] ("no allowlist").
+    cidrs_allowed: Optional[list] = None
     try:
-        result = await run_scan(job, config)
+        config_resp = await client.get_config()
+        fetched = config_resp.get("cidrs_allowed")
+        # A successful fetch yields a list (possibly empty). Only an absent key
+        # leaves it None, which we treat as unavailable -> fail closed.
+        cidrs_allowed = fetched if isinstance(fetched, list) else None
+        if cidrs_allowed is None:
+            logger.warning("get_config returned no cidrs_allowed — failing closed")
+    except Exception as exc:  # noqa: BLE001 — config fetch is best-effort
+        logger.warning("get_config failed (scope unavailable, failing closed): %s", exc)
+
+    try:
+        result = await run_scan(job, config, cidrs_allowed=cidrs_allowed)
     except Exception as exc:
         logger.exception("Scan failed for job_id=%s: %s", job_id, exc)
         state.mark_failed(job_id, str(exc))
         await client.send_log("error", f"Scan failed: {exc}", {"job_id": job_id})
         return
+
+    # Report what was scanned vs dropped by the scope filter (best-effort log).
+    await client.send_log(
+        "info",
+        f"Scan scope applied: scanned={result.kept_targets} dropped={result.dropped_targets}",
+        {"job_id": job_id},
+    )
+    if result.kept_targets is not None and not result.kept_targets:
+        logger.warning("No in-scope targets for job_id=%s — reported 0 findings", job_id)
 
     await client.send_heartbeat(job_id=job_id, progress_pct=80.0)
 

@@ -277,70 +277,100 @@ class TestAgentStateLifecycle(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# D: Scanner stub output characterization
+# D: Scanner output characterization (real nmap -- Fase 2d)
 # ---------------------------------------------------------------------------
+#
+# The synthetic stub (_make_synthetic_findings) was replaced in Fase 2d by a
+# real nmap scanner. These tests now pin the real behavior: run_scan returns a
+# ScanResult, never runs nmap outside the CIDR allowlist, and emits findings in
+# the PHY FindingPayload shape (port int, nvt_oid, detector_signature -- and
+# NOT the old plugin_id/source/"22/tcp" shape).
 
-class TestScannerStubOutput(unittest.TestCase):
-    """Characterize _make_synthetic_findings() output shape and content."""
+class _FakeNmapProc:
+    """asyncio subprocess stand-in returning a fixed nmap XML."""
 
-    def test_stub_returns_exactly_3_findings(self):
-        """The stub scanner always returns exactly 3 findings."""
-        from agent.scanner import _make_synthetic_findings
-        findings = _make_synthetic_findings("10.0.0.1")
-        self.assertEqual(len(findings), 3)
+    _XML = (
+        '<?xml version="1.0"?><nmaprun>'
+        '<host><address addr="10.0.0.5" addrtype="ipv4"/>'
+        '<hostnames><hostname name="db01.lab"/></hostnames>'
+        '<ports><port protocol="tcp" portid="22"><state state="open"/>'
+        '<service name="ssh" product="OpenSSH" version="9.0"/></port></ports>'
+        '</host></nmaprun>'
+    )
 
-    def test_each_finding_has_required_keys(self):
-        """Every finding has the keys expected by PHY FindingPayload."""
-        from agent.scanner import _make_synthetic_findings
-        required_keys = {
-            "title", "severity", "cvss_score", "cve_ids",
-            "host", "port", "description", "solution",
-            "plugin_id", "source",
-        }
-        findings = _make_synthetic_findings("10.0.0.1")
-        for finding in findings:
-            missing = required_keys - finding.keys()
-            self.assertEqual(missing, set(), f"Finding missing keys: {missing}")
+    def __init__(self, returncode=0):
+        self.returncode = returncode
 
-    def test_severity_values_are_valid(self):
-        """Severities are one of: high, medium, info."""
-        from agent.scanner import _make_synthetic_findings, SEVERITY_HIGH, SEVERITY_MEDIUM, SEVERITY_INFO
-        valid = {SEVERITY_HIGH, SEVERITY_MEDIUM, SEVERITY_INFO}
-        findings = _make_synthetic_findings("10.0.0.1")
-        for f in findings:
-            self.assertIn(f["severity"], valid)
+    async def communicate(self):
+        return self._XML.encode(), b""
 
-    def test_host_extracted_from_target_scope(self):
-        """The host field is the first element of a comma-separated target_scope."""
-        from agent.scanner import _make_synthetic_findings
-        findings = _make_synthetic_findings("192.168.10.5, 192.168.10.6")
-        for f in findings:
-            self.assertEqual(f["host"], "192.168.10.5")
+    def kill(self):
+        pass
 
-    def test_host_defaults_to_10_0_0_1_when_empty(self):
-        """When target_scope is empty, host defaults to '10.0.0.1'."""
-        from agent.scanner import _make_synthetic_findings
-        findings = _make_synthetic_findings("")
-        for f in findings:
-            self.assertEqual(f["host"], "10.0.0.1")
+    async def wait(self):
+        return self.returncode
 
-    def test_cve_ids_is_list(self):
-        """cve_ids is always a list (empty for stub findings)."""
-        from agent.scanner import _make_synthetic_findings
-        findings = _make_synthetic_findings("10.0.0.1")
-        for f in findings:
-            self.assertIsInstance(f["cve_ids"], list)
 
-    def test_run_scan_async_returns_scan_result(self):
-        """run_scan() returns a ScanResult with 3 findings and host_count=1."""
+class TestScannerRealNmapOutput(unittest.TestCase):
+    """Characterize run_scan() with nmap mocked (real-nmap engine)."""
+
+    def _patch_nmap(self, returncode=0):
+        import agent.scanner as scanner
+
+        async def fake_exec(*cmd, **kwargs):
+            self._argv = cmd
+            return _FakeNmapProc(returncode)
+
+        self._orig = scanner.asyncio.create_subprocess_exec
+        scanner.asyncio.create_subprocess_exec = fake_exec
+        return scanner
+
+    def tearDown(self):
+        import agent.scanner as scanner
+        if hasattr(self, "_orig"):
+            scanner.asyncio.create_subprocess_exec = self._orig
+
+    def test_run_scan_returns_scan_result(self):
+        """run_scan() returns a ScanResult with findings + real timestamps."""
         from agent.scanner import run_scan
-        job = {"job_id": "char-scan-001", "target_scope": "10.0.0.1"}
-        result = asyncio.run(run_scan(job, _make_config()))
-        self.assertEqual(len(result.findings), 3)
+        self._patch_nmap()
+        job = {"job_id": "char-scan-001", "target_scope": "10.0.0.5"}
+        result = asyncio.run(run_scan(job, _make_config(), cidrs_allowed=["10.0.0.0/24"]))
+        self.assertEqual(len(result.findings), 1)
         self.assertEqual(result.host_count, 1)
         self.assertIsNotNone(result.started_at)
         self.assertIsNotNone(result.completed_at)
-        self.assertIsNone(result.raw_report_path)
+        self.assertIsNotNone(result.raw_report_path)
+        if result.raw_report_path:
+            os.unlink(result.raw_report_path)
+
+    def test_findings_use_finding_payload_shape(self):
+        """Findings carry port:int + nvt_oid (not plugin_id/source/'22/tcp')."""
+        from agent.scanner import run_scan
+        self._patch_nmap()
+        # [] -> RFC1918 private floor; 10.0.0.5 is private so it is scanned.
+        job = {"job_id": "char-scan-002", "target_scope": "10.0.0.5"}
+        result = asyncio.run(run_scan(job, _make_config(), cidrs_allowed=[]))
+        self.assertEqual(len(result.findings), 1)
+        for f in result.findings:
+            self.assertIsInstance(f["port"], int)
+            self.assertIn("nvt_oid", f)
+            self.assertIn("detector_signature", f)
+            self.assertNotIn("plugin_id", f)
+            self.assertNotIn("source", f)
+        if result.raw_report_path:
+            os.unlink(result.raw_report_path)
+
+    def test_out_of_scope_target_never_reaches_nmap(self):
+        """A target outside the allowlist is dropped before nmap runs."""
+        from agent.scanner import run_scan
+        self._patch_nmap()
+        job = {"job_id": "char-scan-003", "target_scope": "8.8.8.8"}
+        result = asyncio.run(run_scan(job, _make_config(), cidrs_allowed=["10.0.0.0/24"]))
+        # nmap was never invoked (no argv captured), 0 findings.
+        self.assertFalse(hasattr(self, "_argv"))
+        self.assertEqual(result.findings, [])
+        self.assertEqual(result.kept_targets, [])
 
 
 # ---------------------------------------------------------------------------
