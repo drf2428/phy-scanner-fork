@@ -1,14 +1,19 @@
 """Scanner engine — real nmap service detection (Mode-1, non-destructive).
 
-Runs ``nmap -sV --open -T4 -Pn`` over the backend-authorized target scope,
-parses the XML report (stdlib ``xml.etree``) into ``FindingPayload``-shaped
-findings, and writes the raw XML to a temp file for upload to PHY S3.
+Runs ``nmap -sV --open -T4 -Pn --script=smb-os-discovery`` over the
+backend-authorized target scope, parses the XML report (stdlib
+``xml.etree``) into ``FindingPayload``-shaped findings, and writes the raw
+XML to a temp file for upload to PHY S3.
 
 Security / §51:
   - Only nmap (local network) + reverse-DNS via the local resolver. No third-
     party calls (no NVD / telemetry / exploit modules).
-  - Detection only: ``-sV --open -T4 -Pn`` — no ``-A``, no ``--script``/NSE,
-    no exploitation. Mode-3 stays gated.
+  - Detection only: ``-sV --open -T4 -Pn`` plus ONE safe NSE script
+    ``smb-os-discovery`` (category: safe+discovery — read-only NetBIOS/SMB
+    banner read, no authentication attempts, no exploitation). The script
+    runs only against hosts where 139/tcp or 445/tcp is already open (nmap
+    applies it automatically per its port rules). No ``-A``, no other
+    ``--script`` flags, no Mode-2/3 capabilities.
   - ``filter_scope`` is the legal control: the agent never runs nmap outside
     the CIDR allowlist (defense-in-depth — target_scope is already backend-
     authorized, but the agent does not trust it blindly).
@@ -235,6 +240,32 @@ def filter_scope(
     return kept
 
 
+def _extract_smb_os_discovery(host: "ET.Element") -> tuple[Optional[str], Optional[str]]:
+    """Extract (computer_name, os_string) from smb-os-discovery hostscript output.
+
+    Returns (None, None) when the script did not run or produced no output —
+    callers must treat absence as a no-op (§50: absent → do not fabricate).
+
+    Handles both key names emitted by different nmap/script versions:
+      - ``Computer Name`` (common) or ``NetBIOS computer name`` (alternate).
+      - ``OS`` for the OS string.
+    """
+    for script_el in host.findall("hostscript/script[@id='smb-os-discovery']"):
+        computer_name: Optional[str] = None
+        os_string: Optional[str] = None
+        for elem in script_el.findall("elem"):
+            key = (elem.get("key") or "").strip()
+            val = (elem.text or "").strip()
+            if not val:
+                continue
+            if key in ("Computer Name", "NetBIOS computer name"):
+                computer_name = val
+            elif key == "OS":
+                os_string = val
+        return computer_name, os_string
+    return None, None
+
+
 def parse_nmap(xml_text: str) -> list[dict]:
     """Parse nmap XML into FindingPayload-shaped findings (ipv4 hosts).
 
@@ -242,6 +273,14 @@ def parse_nmap(xml_text: str) -> list[dict]:
     ``hostnames/hostname`` then ``socket.gethostbyaddr`` short-name, open
     ports -> severity/title/description/solution from SVC (defaults for
     unmapped ports).
+
+    When smb-os-discovery hostscript output is present for a host:
+      - ``Computer Name`` (or ``NetBIOS computer name``) overrides the
+        reverse-DNS short-name as the ``hostname`` (higher quality).
+      - ``OS`` is appended to every finding's ``evidence`` as
+        ``"OS: <os> (smb-os-discovery)"`` — no new top-level field is
+        added; the FindingPayload shape stays stable.
+    Both are optional: absent smb output leaves behaviour unchanged.
     """
     findings: list[dict] = []
     try:
@@ -269,6 +308,11 @@ def parse_nmap(xml_text: str) -> list[dict]:
         if hostname and "." in hostname:
             hostname = hostname.split(".")[0]
 
+        # SMB computer name (higher quality than reverse-DNS) + OS annotation.
+        smb_computer_name, smb_os = _extract_smb_os_discovery(host)
+        if smb_computer_name:
+            hostname = smb_computer_name
+
         for port in host.findall(".//port"):
             stt = port.find("state")
             if stt is None or stt.get("state") != "open":
@@ -288,6 +332,9 @@ def parse_nmap(xml_text: str) -> list[dict]:
                     "Revisar exposición.",
                 ),
             )
+            evidence = f"nmap -sV {ip} -p{pid} -> open ({prod or 'service'})"
+            if smb_os:
+                evidence += f" | OS: {smb_os} (smb-os-discovery)"
             findings.append(
                 {
                     "host": ip,
@@ -300,7 +347,7 @@ def parse_nmap(xml_text: str) -> list[dict]:
                     "title": title,
                     "description": desc + (f" Versión detectada: {prod}." if prod else ""),
                     "solution": sol,
-                    "evidence": f"nmap -sV {ip} -p{pid} -> open ({prod or 'service'})",
+                    "evidence": evidence,
                 }
             )
     return findings
@@ -315,7 +362,7 @@ async def _run_nmap(targets: list[str], timeout: int) -> str:
     local here (a target can never be parsed as a flag) rather than dependent
     on ``filter_scope`` upstream. Returns "" on timeout or non-zero exit.
     """
-    cmd = ["nmap", "-sV", "--open", "-T4", "-Pn", "-oX", "-", "--", *targets]
+    cmd = ["nmap", "-sV", "--open", "-T4", "-Pn", "--script=smb-os-discovery", "-oX", "-", "--", *targets]
     logger.info("Running nmap over %d in-scope target(s)", len(targets))
     proc = await asyncio.create_subprocess_exec(
         *cmd,
