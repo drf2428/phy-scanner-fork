@@ -1,0 +1,421 @@
+"""Tests for the real-nmap scanner: filter_scope, parse_nmap, run_scan.
+
+filter_scope is the §51/legal control — it must never let nmap run outside
+the CIDR allowlist, and must reject malformed / catch-all (0.0.0.0/0) /
+too-broad (> /16) / IPv6 entries on BOTH the target and allowlist sides.
+"""
+from __future__ import annotations
+
+import asyncio
+import os
+from dataclasses import dataclass
+
+import pytest
+
+from agent.scanner import (
+    MAX_HOSTS_PER_SCAN,
+    filter_scope,
+    parse_nmap,
+    run_scan,
+)
+import agent.scanner as scanner
+
+
+# ---------------------------------------------------------------------------
+# Helpers / fixtures
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _Cfg:
+    nmap_timeout_seconds: int = 5
+
+
+# A small, realistic nmap -oX XML fixture: two hosts, one with a hostname and
+# two open ports (22 known, 8080 unmapped), one with a single open port (80)
+# plus a closed port that must be ignored.
+_NMAP_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<nmaprun scanner="nmap" args="nmap -sV --open -T4 -Pn 10.0.0.5 10.0.0.6 -oX -">
+  <host>
+    <status state="up"/>
+    <address addr="10.0.0.5" addrtype="ipv4"/>
+    <hostnames>
+      <hostname name="web01.lab.internal" type="PTR"/>
+    </hostnames>
+    <ports>
+      <port protocol="tcp" portid="22">
+        <state state="open"/>
+        <service name="ssh" product="OpenSSH" version="8.9p1"/>
+      </port>
+      <port protocol="tcp" portid="8080">
+        <state state="open"/>
+        <service name="http-proxy" product="" version=""/>
+      </port>
+    </ports>
+  </host>
+  <host>
+    <status state="up"/>
+    <address addr="10.0.0.6" addrtype="ipv4"/>
+    <hostnames/>
+    <ports>
+      <port protocol="tcp" portid="80">
+        <state state="open"/>
+        <service name="http" product="nginx" version="1.25.0"/>
+      </port>
+      <port protocol="tcp" portid="3389">
+        <state state="closed"/>
+      </port>
+    </ports>
+  </host>
+</nmaprun>
+"""
+
+
+# ---------------------------------------------------------------------------
+# filter_scope — the legal control
+# ---------------------------------------------------------------------------
+
+def test_filter_scope_in_scope_target_kept():
+    """A target inside an allowed CIDR is kept."""
+    kept = filter_scope("10.0.0.5", ["10.0.0.0/24"])
+    assert kept == ["10.0.0.5/32"]
+
+
+def test_filter_scope_out_of_scope_target_dropped():
+    """A target outside every allowed CIDR is dropped."""
+    kept = filter_scope("192.168.99.5", ["10.0.0.0/24"])
+    assert kept == []
+
+
+def test_filter_scope_cidr_target_within_allowlist_kept():
+    """A CIDR target fully contained in an allowed CIDR is kept."""
+    kept = filter_scope("10.0.0.0/28", ["10.0.0.0/24"])
+    assert kept == ["10.0.0.0/28"]
+
+
+def test_filter_scope_cidr_target_not_subnet_dropped():
+    """A CIDR target broader than the allowed CIDR is NOT a subnet -> dropped."""
+    kept = filter_scope("10.0.0.0/16", ["10.0.0.0/24"])
+    assert kept == []
+
+
+def test_filter_scope_malformed_target_dropped():
+    """A malformed target is dropped (not crash)."""
+    kept = filter_scope("not-an-ip, 10.0.0.5", ["10.0.0.0/24"])
+    assert kept == ["10.0.0.5/32"]
+
+
+def test_filter_scope_rejects_catch_all_on_target_side():
+    """0.0.0.0/0 as a target is rejected even with a permissive allowlist."""
+    kept = filter_scope("0.0.0.0/0", ["10.0.0.0/24"])
+    assert kept == []
+
+
+def test_filter_scope_rejects_catch_all_on_allowlist_side():
+    """0.0.0.0/0 in the allowlist is rejected (cannot authorize the world)."""
+    # 0.0.0.0/0 dropped -> validated allowlist empty -> RFC1918 private floor.
+    # A public target (8.8.8.8) is NOT private -> dropped (fail-closed, never
+    # authorized by the discarded catch-all).
+    kept = filter_scope("8.8.8.8", ["0.0.0.0/0"])
+    assert kept == []
+
+
+def test_filter_scope_rejects_oversized_target():
+    """An IPv4 prefix broader than /16 is rejected on the target side."""
+    kept = filter_scope("10.0.0.0/8", ["10.0.0.0/8"])
+    assert kept == []
+
+
+def test_filter_scope_rejects_oversized_allowlist_entry():
+    """A > /16 allowlist entry is discarded; the private floor applies instead."""
+    # /8 allowlist entry dropped -> validated allowlist empty -> private floor.
+    # 172.16.5.0/24 is within 172.16.0.0/12 (private) -> kept. It is NOT
+    # authorized by the rejected /8 — it survives because it is private space.
+    kept = filter_scope("172.16.5.0/24", ["10.0.0.0/8"])
+    assert kept == ["172.16.5.0/24"]
+    # A PUBLIC /24 with the same bad allowlist is dropped (private floor).
+    assert filter_scope("8.8.8.0/24", ["10.0.0.0/8"]) == []
+
+
+def test_filter_scope_drops_ipv6_target():
+    """IPv6 targets are dropped (ipv4-only parse path)."""
+    kept = filter_scope("2001:db8::1, 10.0.0.5", ["10.0.0.0/24"])
+    assert kept == ["10.0.0.5/32"]
+
+
+def test_filter_scope_drops_ipv6_allowlist_entry():
+    """IPv6 allowlist entries are discarded."""
+    kept = filter_scope("10.0.0.5", ["2001:db8::/32"])
+    # ipv6 allow entry dropped -> empty allowlist -> private floor; 10.0.0.5 is
+    # private -> kept.
+    assert kept == ["10.0.0.5/32"]
+
+
+def test_filter_scope_host_cap_skips_offending_target():
+    """A target whose cumulative host count exceeds the cap is skipped."""
+    # [] -> private floor; both /16s are private (10.0.0.0/8), so the cap (not
+    # the floor) is what trims the second one.
+    kept = filter_scope("10.0.0.0/16, 10.1.0.0/16", [])
+    # First /16 (65536) fits exactly; the second would exceed the cumulative cap.
+    assert kept == ["10.0.0.0/16"]
+
+
+def test_filter_scope_single_slash16_at_cap_allowed():
+    """A single private /16 (== cap) is allowed (no allowlist -> private floor)."""
+    kept = filter_scope("10.0.0.0/16", [])
+    assert kept == ["10.0.0.0/16"]
+    # Sanity: the cap constant is exactly a /16 worth of addresses.
+    assert MAX_HOSTS_PER_SCAN == 65536
+
+
+def test_filter_scope_cidrs_none_fails_closed():
+    """cidrs_allowed=None (get_config failed/unknown) -> scan NOTHING."""
+    # Fail closed: even well-formed PRIVATE targets are dropped when the scope
+    # is unavailable. Better no scan than a possibly-unauthorized one.
+    kept = filter_scope("10.0.0.5, 192.168.1.0/24", None)
+    assert kept == []
+
+
+def test_filter_scope_public_ip_dropped_in_private_floor():
+    """No allowlist ([]) -> public IPs are dropped; private kept (private floor)."""
+    kept = filter_scope("8.8.8.8/32, 10.0.0.5/32", [])
+    assert kept == ["10.0.0.5/32"]
+
+
+def test_filter_scope_public_ip_alone_with_none_is_empty():
+    """The review's canary: filter_scope('8.8.8.8/32', None) == []."""
+    assert filter_scope("8.8.8.8/32", None) == []
+
+
+def test_filter_scope_cidrs_empty_list_private_floor():
+    """cidrs_allowed=[] (no allowlist) -> RFC1918 private floor."""
+    kept = filter_scope("10.0.0.5", [])
+    assert kept == ["10.0.0.5/32"]
+    # All three RFC1918 ranges are honored.
+    assert filter_scope("172.16.0.1, 192.168.1.1", []) == ["172.16.0.1/32", "192.168.1.1/32"]
+
+
+# ---------------------------------------------------------------------------
+# parse_nmap — FindingPayload shape
+# ---------------------------------------------------------------------------
+
+def test_parse_nmap_returns_findings_for_open_ports_only():
+    """Closed ports are ignored; only open ports produce findings."""
+    findings = parse_nmap(_NMAP_XML)
+    # host1: 22 + 8080 ; host2: 80 (3389 closed -> ignored) = 3 findings
+    assert len(findings) == 3
+    ports = sorted(f["port"] for f in findings)
+    assert ports == [22, 80, 8080]
+
+
+def test_parse_nmap_port_is_int():
+    """port must be an int (FindingPayload expects int|None, not '22/tcp')."""
+    findings = parse_nmap(_NMAP_XML)
+    for f in findings:
+        assert isinstance(f["port"], int)
+
+
+def test_parse_nmap_hostname_short_name():
+    """hostname is the short name (FQDN split on first dot)."""
+    findings = parse_nmap(_NMAP_XML)
+    host1 = [f for f in findings if f["host"] == "10.0.0.5"][0]
+    assert host1["hostname"] == "web01"
+
+
+def test_parse_nmap_nvt_oid_and_signature_present():
+    """Every finding has nvt_oid + detector_signature (required by FindingPayload)."""
+    findings = parse_nmap(_NMAP_XML)
+    for f in findings:
+        assert f["nvt_oid"].startswith("1.3.6.1.4.1.25623.1.0.phy.nmap.")
+        assert f["detector_signature"] == "phy-scanner:nmap-service-detection"
+
+
+def test_parse_nmap_known_port_uses_svc_map():
+    """A known port (22) uses the SVC severity/title (medium SSH)."""
+    findings = parse_nmap(_NMAP_XML)
+    ssh = [f for f in findings if f["port"] == 22][0]
+    assert ssh["severity"] == "medium"
+    assert "SSH" in ssh["title"]
+
+
+def test_parse_nmap_unknown_port_defaults_low():
+    """An unmapped port (8080) defaults to low severity + generic title."""
+    findings = parse_nmap(_NMAP_XML)
+    proxy = [f for f in findings if f["port"] == 8080][0]
+    assert proxy["severity"] == "low"
+    assert "8080" in proxy["title"]
+
+
+def test_parse_nmap_version_appended_to_description():
+    """Detected product/version is appended to the description."""
+    findings = parse_nmap(_NMAP_XML)
+    ssh = [f for f in findings if f["port"] == 22][0]
+    assert "OpenSSH 8.9p1" in ssh["description"]
+
+
+def test_parse_nmap_matches_finding_payload_shape():
+    """Emitted keys are a subset of FindingPayload fields (extra='forbid')."""
+    # The PHY FindingPayload fields (asm/app/schemas/asm_internal.py).
+    allowed = {
+        "host", "hostname", "port", "protocol", "severity",
+        "cvss_score", "cve_id", "cve_ids", "nvt_oid", "detector_signature",
+        "title", "description", "solution", "evidence", "references",
+    }
+    findings = parse_nmap(_NMAP_XML)
+    assert findings
+    for f in findings:
+        extra = set(f.keys()) - allowed
+        assert extra == set(), f"emits keys outside FindingPayload: {extra}"
+        # The old synthetic shape must NOT appear.
+        assert "plugin_id" not in f
+        assert "source" not in f
+        assert f["severity"] in {"critical", "high", "medium", "low", "info"}
+
+
+def test_parse_nmap_malformed_xml_returns_empty():
+    """Malformed XML returns [] (no crash)."""
+    assert parse_nmap("<not-valid-xml") == []
+
+
+# ---------------------------------------------------------------------------
+# run_scan — nmap mocked
+# ---------------------------------------------------------------------------
+
+class _FakeProc:
+    """Minimal asyncio subprocess stand-in returning a fixed XML on stdout."""
+
+    def __init__(self, stdout: bytes, returncode: int = 0):
+        self._stdout = stdout
+        self.returncode = returncode
+
+    async def communicate(self):
+        return self._stdout, b""
+
+    def kill(self):  # pragma: no cover - not exercised in happy path
+        pass
+
+    async def wait(self):  # pragma: no cover
+        return self.returncode
+
+
+def test_run_scan_with_mocked_nmap(monkeypatch):
+    """run_scan with nmap mocked -> findings parsed + raw report written."""
+    captured_argv = {}
+
+    async def fake_exec(*cmd, **kwargs):
+        captured_argv["cmd"] = cmd
+        return _FakeProc(_NMAP_XML.encode())
+
+    monkeypatch.setattr(scanner.asyncio, "create_subprocess_exec", fake_exec)
+
+    job = {"job_id": "job-1", "target_scope": "10.0.0.5, 10.0.0.6"}
+    result = asyncio.run(run_scan(job, _Cfg(), cidrs_allowed=["10.0.0.0/24"]))
+
+    assert len(result.findings) == 3
+    assert result.host_count == 2
+    assert result.kept_targets == ["10.0.0.5/32", "10.0.0.6/32"]
+    assert result.dropped_targets == []
+    # Raw XML written to a temp file for S3 upload.
+    assert result.raw_report_path and os.path.exists(result.raw_report_path)
+    with open(result.raw_report_path, encoding="utf-8") as fh:
+        assert "<nmaprun" in fh.read()
+    os.unlink(result.raw_report_path)
+
+    # nmap invoked with the Mode-1 flags, then -oX - -- , then ONLY in-scope targets.
+    cmd = captured_argv["cmd"]
+    assert cmd[:8] == ("nmap", "-sV", "--open", "-T4", "-Pn", "-oX", "-", "--")
+    assert cmd[8:] == ("10.0.0.5/32", "10.0.0.6/32")
+    # The -- end-of-options separator precedes every target.
+    sep = cmd.index("--")
+    assert all(not t.startswith("-") for t in cmd[sep + 1:])
+    # No exploitation / scripting flags.
+    assert "-A" not in cmd
+    assert "--script" not in cmd
+
+
+def test_run_scan_filter_drops_out_of_scope_targets(monkeypatch):
+    """Out-of-scope targets are dropped before nmap is invoked."""
+    captured_argv = {}
+
+    async def fake_exec(*cmd, **kwargs):
+        captured_argv["cmd"] = cmd
+        return _FakeProc(_NMAP_XML.encode())
+
+    monkeypatch.setattr(scanner.asyncio, "create_subprocess_exec", fake_exec)
+
+    job = {"job_id": "job-2", "target_scope": "10.0.0.5, 192.168.99.9"}
+    result = asyncio.run(run_scan(job, _Cfg(), cidrs_allowed=["10.0.0.0/24"]))
+
+    assert result.kept_targets == ["10.0.0.5/32"]
+    assert result.dropped_targets == ["192.168.99.9"]
+    # The out-of-scope IP must NOT be in the nmap argv.
+    assert "192.168.99.9" not in captured_argv["cmd"]
+    if result.raw_report_path:
+        os.unlink(result.raw_report_path)
+
+
+def test_run_scan_no_in_scope_targets_skips_nmap(monkeypatch):
+    """When nothing is in-scope, nmap is NOT run and 0 findings are reported."""
+    called = {"exec": False}
+
+    async def fake_exec(*cmd, **kwargs):  # pragma: no cover - must not run
+        called["exec"] = True
+        return _FakeProc(b"")
+
+    monkeypatch.setattr(scanner.asyncio, "create_subprocess_exec", fake_exec)
+
+    job = {"job_id": "job-3", "target_scope": "192.168.99.9"}
+    result = asyncio.run(run_scan(job, _Cfg(), cidrs_allowed=["10.0.0.0/24"]))
+
+    assert called["exec"] is False
+    assert result.findings == []
+    assert result.host_count == 0
+    assert result.raw_report_path is None
+    assert result.kept_targets == []
+    assert result.dropped_targets == ["192.168.99.9"]
+
+
+def test_run_scan_accepts_list_target_scope(monkeypatch):
+    """target_scope may arrive as a list (PollResponse shape) — normalized."""
+    async def fake_exec(*cmd, **kwargs):
+        return _FakeProc(_NMAP_XML.encode())
+
+    monkeypatch.setattr(scanner.asyncio, "create_subprocess_exec", fake_exec)
+
+    job = {"job_id": "job-4", "target_scope": ["10.0.0.5", "10.0.0.6"]}
+    # [] -> RFC1918 private floor; both targets are private so both are kept.
+    result = asyncio.run(run_scan(job, _Cfg(), cidrs_allowed=[]))
+    assert result.kept_targets == ["10.0.0.5/32", "10.0.0.6/32"]
+    if result.raw_report_path:
+        os.unlink(result.raw_report_path)
+
+
+def test_run_scan_nmap_nonzero_exit_no_report(monkeypatch):
+    """nmap non-zero exit -> empty XML -> 0 findings, no raw report."""
+    async def fake_exec(*cmd, **kwargs):
+        return _FakeProc(b"", returncode=1)
+
+    monkeypatch.setattr(scanner.asyncio, "create_subprocess_exec", fake_exec)
+
+    job = {"job_id": "job-5", "target_scope": "10.0.0.5"}
+    result = asyncio.run(run_scan(job, _Cfg(), cidrs_allowed=[]))
+    assert result.findings == []
+    assert result.raw_report_path is None
+
+
+def test_run_scan_cidrs_none_fails_closed_no_nmap(monkeypatch):
+    """run_scan with cidrs_allowed=None (scope unavailable) -> no nmap, 0 findings."""
+    called = {"exec": False}
+
+    async def fake_exec(*cmd, **kwargs):  # pragma: no cover - must not run
+        called["exec"] = True
+        return _FakeProc(b"")
+
+    monkeypatch.setattr(scanner.asyncio, "create_subprocess_exec", fake_exec)
+
+    # A private, otherwise-valid target is STILL not scanned when scope is unknown.
+    job = {"job_id": "job-6", "target_scope": "10.0.0.5"}
+    result = asyncio.run(run_scan(job, _Cfg(), cidrs_allowed=None))
+    assert called["exec"] is False
+    assert result.findings == []
+    assert result.kept_targets == []
+    assert result.dropped_targets == ["10.0.0.5"]
