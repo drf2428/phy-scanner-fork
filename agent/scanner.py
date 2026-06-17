@@ -1,6 +1,6 @@
 """Scanner engine — real nmap service detection (Mode-1, non-destructive).
 
-Runs ``nmap -sV --open -T4 -Pn --script=smb-os-discovery`` over the
+Runs ``nmap -sV --open -T4 -Pn --script=<_NSE_SCRIPTS>`` over the
 backend-authorized target scope, parses the XML report (stdlib
 ``xml.etree``) into ``FindingPayload``-shaped findings, and writes the raw
 XML to a temp file for upload to PHY S3.
@@ -8,15 +8,22 @@ XML to a temp file for upload to PHY S3.
 Security / §51:
   - Only nmap (local network) + reverse-DNS via the local resolver. No third-
     party calls (no NVD / telemetry / exploit modules).
-  - Detection only: ``-sV --open -T4 -Pn`` plus ONE safe NSE script
-    ``smb-os-discovery`` (category: safe+discovery — read-only NetBIOS/SMB
-    banner read, no authentication attempts, no exploitation). The script
-    runs only against hosts where 139/tcp or 445/tcp is already open (nmap
-    applies it automatically per its port rules). No ``-A``, no other
-    ``--script`` flags, no Mode-2/3 capabilities.
+  - Detection only: ``-sV --open -T4 -Pn`` plus a FROZEN, CURATED allowlist
+    of safe+no-egress NSE scripts (``_NSE_SCRIPTS``). ALL scripts are in
+    nmap's ``safe`` category — no authentication attempts, no exploitation,
+    no external callbacks. ``ssl-enum-ciphers`` was intentionally excluded
+    because it is ``intrusive``, not ``safe``. The allowlist is a module-level
+    constant; it is NEVER sourced from config/env/backend (gate fix #2 —
+    prevents config-injection bypass of §51). No ``-A``, no ``--script vuln``
+    wholesale, no ``brute``/``dos``/``exploit``/``intrusive``/``external``
+    category tokens ever enter the nmap argv.
   - ``filter_scope`` is the legal control: the agent never runs nmap outside
     the CIDR allowlist (defense-in-depth — target_scope is already backend-
     authorized, but the agent does not trust it blindly).
+  - CVE references found in safe script output (offline regex, no network
+    call) are captured in ``cve_ids`` so PHY's 1b enrichment can resolve
+    CWE/EPSS/KEV/ATT&CK from ti_advisories offline. Cap of 10 CVE-ids per
+    finding prevents attacker-controlled output injecting unbounded data.
 """
 from __future__ import annotations
 
@@ -34,14 +41,59 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# §51 NSE allowlist — FROZEN, curated, hardcoded (gate fix #2).
+#
+# This tuple is the ONLY source of NSE script names that ever reach nmap.
+# It must NEVER be derived from config / env / backend responses — doing so
+# would make the no-exfil / no-exploitation gate bypassable by config
+# injection.  Tests assert that the effective argv script set equals exactly
+# this constant.
+#
+# All scripts are nmap category ``safe`` (no-DoS, no-auth, no-exploitation)
+# AND no-egress (no outbound connections to third-party services).
+# ``ssl-enum-ciphers`` was intentionally dropped — it is ``intrusive``, not
+# ``safe``.  ``vulners`` and ``vulscan`` are excluded because they are
+# ``external`` (call vulners.com/third-party DB) — §51 prohibits them.
+# No ``brute``, ``dos``, ``exploit``, or ``intrusive`` script/category is
+# present or permitted.
+# ---------------------------------------------------------------------------
+_NSE_SCRIPTS: tuple[str, ...] = (
+    "smb-os-discovery",    # safe: NetBIOS/SMB name + OS (already proven E2E)
+    "smb2-security-mode",  # safe: SMB signing required/not-required (attack-path signal)
+    "smb-protocols",       # safe: enumerate supported SMB dialects
+    "ssl-cert",            # safe: TLS cert details, expiry, weak-key detection
+    "ssh2-enum-algos",     # safe: SSH key-exchange / cipher / MAC algorithm lists
+    "rdp-ntlm-info",       # safe: RDP NTLM authentication info banner (Windows targets)
+    "http-headers",        # safe: HTTP response headers (security-header gaps)
+    "http-title",          # safe: page title for fingerprinting
+    "http-server-header",  # safe: Server header (version fingerprint)
+    "snmp-info",           # safe: SNMP system info (sysDescr, sysObjectID)
+    "ftp-anon",            # safe: anonymous FTP login detection
+    "smtp-commands",       # safe: SMTP EHLO banner + supported commands
+    "banner",              # safe: raw TCP banner grab (generic service fingerprint)
+)
+
+# The comma-joined script list is pre-computed once at import time so it can
+# be tested as a constant and never reconstructed from mutable data.
+_NSE_SCRIPTS_ARG: str = "--script=" + ",".join(_NSE_SCRIPTS)
+
 # Severity constants aligned with PHY FindingPayload
 SEVERITY_HIGH = "high"
 SEVERITY_MEDIUM = "medium"
 SEVERITY_LOW = "low"
 SEVERITY_INFO = "info"
 
-# Bounded nmap runtime (seconds). Mirrors the proven lab appliance.
-NMAP_TIMEOUT_SECONDS = 900
+# Bounded nmap runtime (seconds).
+# With 13 NSE scripts the scan takes substantially longer than the single
+# smb-os-discovery run.  Per-host overhead for the full script set on a lab
+# subnet (10–50 hosts) is roughly 5–15 s extra vs. service detection alone.
+# A /24 (254 live hosts, worst-case) with all scripts: ~30–45 min.  The
+# timeout is raised to 1800 s (30 min) to avoid partial results for
+# medium-sized subnets while still bounding runaway scans.
+# Operators who need a longer cap can set the ``nmap_timeout_seconds``
+# attribute on the config object; the constant is the fallback floor.
+NMAP_TIMEOUT_SECONDS = 1800
 
 # Reject IPv4 networks broader than this prefix (too-broad / abuse guard).
 MIN_IPV4_PREFIX = 16
@@ -241,12 +293,17 @@ def filter_scope(
     return kept
 
 
-# smb-os-discovery elem values are FULLY attacker-controlled: a rogue or
-# compromised scan target controls the SMB negotiate response that the script
-# reads. We sanitize and bound them at the trust boundary (this module) before
-# they flow into the finding hostname / evidence — defense-in-depth on top of
-# the backend's own truncation + parameterized INSERT. Strip C0/C1-ish control
-# chars + DEL (incl. NUL/newlines so nothing can inject extra lines/garbage).
+# ---------------------------------------------------------------------------
+# Script output sanitization (attacker-controlled data)
+# ---------------------------------------------------------------------------
+# NSE script outputs are FULLY attacker-controlled: a rogue or compromised
+# scan target can return arbitrary bytes in its service banner / SMB negotiate
+# response / SSL certificate fields / etc.  We sanitize at the trust boundary
+# before the data enters finding evidence — defense-in-depth on top of the
+# backend's own truncation and parameterized INSERT.
+#
+# Strip C0/C1-ish control chars + DEL (incl. NUL/newlines so nothing can
+# inject extra lines into the single-line evidence string).
 _SMB_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 
 # nmap renders non-printable bytes in <elem> text / `output` as the LITERAL
@@ -258,6 +315,19 @@ _SMB_NMAP_ESCAPE = re.compile(r"\\x[0-9a-fA-F]{2}")
 _SMB_NAME_MAX = 255
 # OS string is annotated into evidence text only; bound it independently.
 _SMB_OS_MAX = 256
+
+# Maximum characters taken from any single script's ``output`` attribute when
+# appended to finding evidence.  Script output is attacker-controlled; a rogue
+# target can emit arbitrarily long strings.  This bounds the per-script
+# contribution to ~one line of context without truncating useful signal.
+_SCRIPT_OUTPUT_MAX = 200
+
+# CVE reference regex.  Matches CVE-YYYY-NNNNN (1–7 digits) as reported by
+# safe NSE scripts (e.g. ssl-cert reporting a cert with a known CVE).
+# BOUNDED: we capture at most _CVE_CAP matches per finding to prevent a
+# compromised target injecting thousands of CVE IDs.
+_CVE_RE = re.compile(r"CVE-\d{4}-\d{1,7}", re.IGNORECASE)
+_CVE_CAP = 10
 
 
 def _sanitize_smb_field(value: Optional[str], max_len: int) -> Optional[str]:
@@ -323,6 +393,72 @@ def _extract_smb_os_discovery(host: "ET.Element") -> tuple[Optional[str], Option
     return None, None
 
 
+def _sanitize_script_output(raw: Optional[str]) -> Optional[str]:
+    """Sanitize a single NSE script's ``output`` attribute for use in evidence.
+
+    Script output is attacker-controlled (the scan target controls what the
+    service returns).  We:
+      1. Strip C0/C1 control chars + DEL (same range as ``_sanitize_smb_field``
+         — prevents newline injection into the single-line evidence string).
+      2. Strip nmap's literal ``\\xNN`` escape sequences (same as SMB path).
+      3. Cap at ``_SCRIPT_OUTPUT_MAX`` characters.
+      4. Return None if nothing remains after stripping.
+    """
+    if not raw:
+        return None
+    cleaned = _SMB_NMAP_ESCAPE.sub("", raw)
+    cleaned = _SMB_CONTROL_CHARS.sub("", cleaned).strip()[:_SCRIPT_OUTPUT_MAX]
+    return cleaned or None
+
+
+def _extract_script_intel(
+    scripts: list["ET.Element"],
+) -> tuple[list[str], list[str]]:
+    """Extract (evidence_fragments, cve_ids) from a list of <script> elements.
+
+    For each script whose id is in ``_NSE_SCRIPTS`` (allowlist gate):
+      - Take the first line of the sanitized ``output`` attribute and append
+        as ``" | <id>: <output>"`` to the evidence fragments list.
+      - Regex-search the raw output for CVE references (offline, §51) and
+        collect at most ``_CVE_CAP`` unique CVE-IDs across all scripts.
+
+    Scripts whose id is NOT in ``_NSE_SCRIPTS`` are silently ignored —
+    this is a defense-in-depth gate even though nmap only runs the allowlist.
+    The ``smb-os-discovery`` id is included in ``_NSE_SCRIPTS`` but its
+    hostname/OS extraction is handled by ``_extract_smb_os_discovery``; its
+    output attribute is still searched for CVE references here.
+
+    Returns (evidence_fragments, cve_ids) — both may be empty lists.
+    """
+    _allowed = frozenset(_NSE_SCRIPTS)
+    evidence_parts: list[str] = []
+    cve_ids: list[str] = []
+    seen_cves: set[str] = set()
+
+    for script_el in scripts:
+        sid = script_el.get("id", "")
+        if sid not in _allowed:
+            continue
+        raw_output = script_el.get("output") or ""
+
+        # Evidence fragment: sanitized first line only.
+        sanitized = _sanitize_script_output(raw_output)
+        if sanitized:
+            evidence_parts.append(f" | {sid}: {sanitized}")
+
+        # CVE catch (offline — no network): bounded by _CVE_CAP.
+        if len(seen_cves) < _CVE_CAP:
+            for m in _CVE_RE.finditer(raw_output):
+                cve = m.group(0).upper()
+                if cve not in seen_cves:
+                    seen_cves.add(cve)
+                    cve_ids.append(cve)
+                    if len(seen_cves) >= _CVE_CAP:
+                        break
+
+    return evidence_parts, cve_ids
+
+
 def parse_nmap(xml_text: str) -> list[dict]:
     """Parse nmap XML into FindingPayload-shaped findings (ipv4 hosts).
 
@@ -331,13 +467,15 @@ def parse_nmap(xml_text: str) -> list[dict]:
     ports -> severity/title/description/solution from SVC (defaults for
     unmapped ports).
 
-    When smb-os-discovery hostscript output is present for a host:
-      - ``Computer Name`` (or ``NetBIOS computer name``) overrides the
-        reverse-DNS short-name as the ``hostname`` (higher quality).
-      - ``OS`` is appended to every finding's ``evidence`` as
-        ``"OS: <os> (smb-os-discovery)"`` — no new top-level field is
-        added; the FindingPayload shape stays stable.
-    Both are optional: absent smb output leaves behaviour unchanged.
+    NSE script output enrichment (v0.4.0):
+      - For each open port, host-level ``<hostscript>/<script>`` elements AND
+        port-level ``<port>/<script>`` elements whose id is in ``_NSE_SCRIPTS``
+        are collected.  Their sanitized first-line output is appended to the
+        finding's ``evidence`` as ``" | <script-id>: <output>"``.
+      - CVE references found in script output are collected into ``cve_ids``
+        (capped at ``_CVE_CAP``; offline only — §51).
+      - The existing smb-os-discovery hostname/OS extraction is preserved.
+      - ``FindingPayload`` shape stays stable — no new top-level keys.
     """
     findings: list[dict] = []
     try:
@@ -370,6 +508,10 @@ def parse_nmap(xml_text: str) -> list[dict]:
         if smb_computer_name:
             hostname = smb_computer_name
 
+        # Collect host-level script elements (apply to every port finding).
+        host_scripts: list["ET.Element"] = host.findall("hostscript/script")
+        host_evidence_parts, host_cve_ids = _extract_script_intel(host_scripts)
+
         for port in host.findall(".//port"):
             stt = port.find("state")
             if stt is None or stt.get("state") != "open":
@@ -392,21 +534,39 @@ def parse_nmap(xml_text: str) -> list[dict]:
             evidence = f"nmap -sV {ip} -p{pid} -> open ({prod or 'service'})"
             if smb_os:
                 evidence += f" | OS: {smb_os} (smb-os-discovery)"
-            findings.append(
-                {
-                    "host": ip,
-                    "hostname": hostname,
-                    "port": pid,
-                    "protocol": proto,
-                    "severity": sev,
-                    "nvt_oid": f"1.3.6.1.4.1.25623.1.0.phy.nmap.{pid}",
-                    "detector_signature": "phy-scanner:nmap-service-detection",
-                    "title": title,
-                    "description": desc + (f" Versión detectada: {prod}." if prod else ""),
-                    "solution": sol,
-                    "evidence": evidence,
-                }
-            )
+
+            # Port-level script elements (e.g. ssl-cert, ftp-anon on 443/21).
+            port_scripts: list["ET.Element"] = port.findall("script")
+            port_evidence_parts, port_cve_ids = _extract_script_intel(port_scripts)
+
+            # Merge: host-level intel applies to every port; port-level is additive.
+            all_evidence_parts = host_evidence_parts + port_evidence_parts
+            evidence += "".join(all_evidence_parts)
+
+            all_cve_ids: list[str] = []
+            seen: set[str] = set()
+            for cve in host_cve_ids + port_cve_ids:
+                if cve not in seen and len(seen) < _CVE_CAP:
+                    seen.add(cve)
+                    all_cve_ids.append(cve)
+
+            finding: dict = {
+                "host": ip,
+                "hostname": hostname,
+                "port": pid,
+                "protocol": proto,
+                "severity": sev,
+                "nvt_oid": f"1.3.6.1.4.1.25623.1.0.phy.nmap.{pid}",
+                "detector_signature": "phy-scanner:nmap-service-detection",
+                "title": title,
+                "description": desc + (f" Versión detectada: {prod}." if prod else ""),
+                "solution": sol,
+                "evidence": evidence,
+            }
+            if all_cve_ids:
+                finding["cve_ids"] = all_cve_ids
+                finding["cve_id"] = all_cve_ids[0]
+            findings.append(finding)
     return findings
 
 
@@ -419,7 +579,7 @@ async def _run_nmap(targets: list[str], timeout: int) -> str:
     local here (a target can never be parsed as a flag) rather than dependent
     on ``filter_scope`` upstream. Returns "" on timeout or non-zero exit.
     """
-    cmd = ["nmap", "-sV", "--open", "-T4", "-Pn", "--script=smb-os-discovery", "-oX", "-", "--", *targets]
+    cmd = ["nmap", "-sV", "--open", "-T4", "-Pn", _NSE_SCRIPTS_ARG, "-oX", "-", "--", *targets]
     logger.info("Running nmap over %d in-scope target(s)", len(targets))
     proc = await asyncio.create_subprocess_exec(
         *cmd,
