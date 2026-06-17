@@ -14,6 +14,8 @@ import pytest
 
 from agent.scanner import (
     MAX_HOSTS_PER_SCAN,
+    _NSE_SCRIPTS,
+    _NSE_SCRIPTS_ARG,
     filter_scope,
     parse_nmap,
     run_scan,
@@ -530,7 +532,7 @@ def test_parse_nmap_smb_name_all_control_chars_falls_back():
 
 
 def test_run_scan_script_arg_present_and_scope_unchanged(monkeypatch):
-    """--script=smb-os-discovery is in nmap argv; filter_scope behaviour is unaffected."""
+    """The frozen _NSE_SCRIPTS_ARG is in nmap argv; filter_scope is unaffected."""
     captured_argv = {}
 
     async def fake_exec(*cmd, **kwargs):
@@ -543,7 +545,10 @@ def test_run_scan_script_arg_present_and_scope_unchanged(monkeypatch):
     result = asyncio.run(run_scan(job, _Cfg(), cidrs_allowed=["10.0.1.0/24"]))
 
     cmd = captured_argv["cmd"]
-    assert "--script=smb-os-discovery" in cmd
+    # The script argument equals the pre-computed frozen constant — no more, no less.
+    assert _NSE_SCRIPTS_ARG in cmd
+    # smb-os-discovery is still present (it's in _NSE_SCRIPTS).
+    assert "smb-os-discovery" in _NSE_SCRIPTS_ARG
     # The -- separator still precedes targets; no target looks like a flag.
     sep = cmd.index("--")
     assert all(not t.startswith("-") for t in cmd[sep + 1:])
@@ -610,24 +615,23 @@ def test_run_scan_with_mocked_nmap(monkeypatch):
         assert "<nmaprun" in fh.read()
     os.unlink(result.raw_report_path)
 
-    # nmap invoked with the Mode-1 flags + safe discovery script, then -oX - -- ,
+    # nmap invoked with the Mode-1 flags + frozen allowlist, then -oX - -- ,
     # then ONLY in-scope targets.
     cmd = captured_argv["cmd"]
     assert cmd[:9] == (
         "nmap", "-sV", "--open", "-T4", "-Pn",
-        "--script=smb-os-discovery",
+        _NSE_SCRIPTS_ARG,
         "-oX", "-", "--",
     )
     assert cmd[9:] == ("10.0.0.5/32", "10.0.0.6/32")
     # The -- end-of-options separator precedes every target.
     sep = cmd.index("--")
     assert all(not t.startswith("-") for t in cmd[sep + 1:])
-    # No exploitation / aggressive flags; only the ONE safe discovery script.
+    # No exploitation / aggressive flags.
     assert "-A" not in cmd
-    assert "--script=smb-os-discovery" in cmd
-    # Confirm no other --script flag is present (only the safe one above).
-    extra_scripts = [a for a in cmd if a.startswith("--script") and a != "--script=smb-os-discovery"]
-    assert extra_scripts == [], f"unexpected --script flags: {extra_scripts}"
+    # Exactly one --script argument: the frozen allowlist constant.
+    script_args = [a for a in cmd if a.startswith("--script")]
+    assert len(script_args) == 1 and script_args[0] == _NSE_SCRIPTS_ARG
 
 
 def test_run_scan_filter_drops_out_of_scope_targets(monkeypatch):
@@ -756,3 +760,481 @@ def test_parse_nmap_smb_real_format_server_elem_and_nul_stripped():
     ev = f["evidence"] if isinstance(f, dict) else f.evidence
     assert hn == "DC01LAB", f"hostname should be the clean SMB Computer Name, got {hn!r}"
     assert "Windows 6.1" in ev, f"OS should be annotated in evidence, got {ev!r}"
+
+
+# ===========================================================================
+# NSE deepening v0.4.0 — new tests
+# §51 allowlist gate, script-output enrichment, CVE offline catch,
+# sanitization of attacker-controlled output, filter_scope unchanged.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# §51-critical: argv allowlist guard
+# ---------------------------------------------------------------------------
+
+_FORBIDDEN_CATEGORY_TOKENS = ("vuln", "external", "intrusive", "brute", "dos", "exploit")
+
+
+def test_nse_scripts_constant_is_frozen_tuple():
+    """_NSE_SCRIPTS is an immutable tuple — not a list, not sourced from config."""
+    assert isinstance(_NSE_SCRIPTS, tuple), "_NSE_SCRIPTS must be a tuple (immutable)"
+    assert len(_NSE_SCRIPTS) > 0
+
+
+def test_nse_scripts_no_forbidden_categories():
+    """No NSE category token (vuln/external/intrusive/brute/dos/exploit) in allowlist."""
+    for name in _NSE_SCRIPTS:
+        for forbidden in _FORBIDDEN_CATEGORY_TOKENS:
+            assert forbidden not in name, (
+                f"Forbidden category token {forbidden!r} found in _NSE_SCRIPTS entry {name!r}"
+            )
+
+
+def test_nse_scripts_smb_os_discovery_present():
+    """smb-os-discovery must remain in the allowlist (hostname/OS extraction depends on it)."""
+    assert "smb-os-discovery" in _NSE_SCRIPTS
+
+
+def test_nse_scripts_ssl_enum_ciphers_absent():
+    """ssl-enum-ciphers is DROPPED (intrusive, not safe) — must not appear."""
+    assert "ssl-enum-ciphers" not in _NSE_SCRIPTS
+
+
+def test_nse_scripts_arg_equals_constant_joined():
+    """_NSE_SCRIPTS_ARG is exactly '--script=' + ','.join(_NSE_SCRIPTS)."""
+    expected = "--script=" + ",".join(_NSE_SCRIPTS)
+    assert _NSE_SCRIPTS_ARG == expected
+
+
+def test_run_scan_argv_allowlist_exact(monkeypatch):
+    """The script set passed to nmap equals _NSE_SCRIPTS exactly.
+
+    No forbidden category token (vuln/external/intrusive/brute/dos/exploit)
+    and no unlisted script name appears in nmap argv.  The allowlist is sourced
+    from the constant, not from config.
+    """
+    captured_argv = {}
+
+    async def fake_exec(*cmd, **kwargs):
+        captured_argv["cmd"] = cmd
+        return _FakeProc(_NMAP_XML.encode())
+
+    monkeypatch.setattr(scanner.asyncio, "create_subprocess_exec", fake_exec)
+
+    job = {"job_id": "job-allowlist", "target_scope": "10.0.0.5"}
+    asyncio.run(run_scan(job, _Cfg(), cidrs_allowed=["10.0.0.0/24"]))
+
+    cmd = captured_argv["cmd"]
+
+    # Exactly one --script argument.
+    script_args = [a for a in cmd if a.startswith("--script")]
+    assert len(script_args) == 1, f"expected exactly 1 --script arg, got: {script_args}"
+
+    # That argument equals the constant exactly.
+    assert script_args[0] == _NSE_SCRIPTS_ARG, (
+        f"nmap argv script arg diverges from constant:\n"
+        f"  got:      {script_args[0]}\n"
+        f"  expected: {_NSE_SCRIPTS_ARG}"
+    )
+
+    # No forbidden category token anywhere in the full argv.
+    full_argv_str = " ".join(cmd)
+    for forbidden in _FORBIDDEN_CATEGORY_TOKENS:
+        assert forbidden not in full_argv_str, (
+            f"Forbidden token {forbidden!r} found in nmap argv"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Script output enrichment: parse_nmap reads hostscript + port-script elements
+# ---------------------------------------------------------------------------
+
+# Fixture: ftp-anon on port 21 (port-level script).
+_NMAP_XML_FTP_ANON = """<?xml version="1.0" encoding="UTF-8"?>
+<nmaprun scanner="nmap" args="nmap -sV --open -T4 -Pn 10.0.3.1">
+  <host>
+    <address addr="10.0.3.1" addrtype="ipv4"/>
+    <hostnames/>
+    <ports>
+      <port protocol="tcp" portid="21">
+        <state state="open"/>
+        <service name="ftp" product="vsftpd" version="3.0.3"/>
+        <script id="ftp-anon" output="Anonymous FTP login allowed (FTP code 230)"/>
+      </port>
+    </ports>
+  </host>
+</nmaprun>
+"""
+
+# Fixture: ssl-cert on port 443 (port-level script).
+_NMAP_XML_SSL_CERT = """<?xml version="1.0" encoding="UTF-8"?>
+<nmaprun scanner="nmap" args="nmap -sV --open -T4 -Pn 10.0.3.2">
+  <host>
+    <address addr="10.0.3.2" addrtype="ipv4"/>
+    <hostnames/>
+    <ports>
+      <port protocol="tcp" portid="443">
+        <state state="open"/>
+        <service name="https" product="nginx" version="1.25.0"/>
+        <script id="ssl-cert" output="Subject: CN=example.com; Issuer: CN=Let's Encrypt; Not valid after: 2024-01-01"/>
+      </port>
+    </ports>
+  </host>
+</nmaprun>
+"""
+
+# Fixture: smb2-security-mode on port 445 (port-level script).
+_NMAP_XML_SMB2_MODE = """<?xml version="1.0" encoding="UTF-8"?>
+<nmaprun scanner="nmap" args="nmap -sV --open -T4 -Pn 10.0.3.3">
+  <host>
+    <address addr="10.0.3.3" addrtype="ipv4"/>
+    <hostnames/>
+    <ports>
+      <port protocol="tcp" portid="445">
+        <state state="open"/>
+        <service name="microsoft-ds" product="Samba smbd" version="4.x"/>
+        <script id="smb2-security-mode" output="2.02: Message signing enabled but not required"/>
+      </port>
+    </ports>
+  </host>
+</nmaprun>
+"""
+
+# Fixture: http-headers on port 80 (port-level script).
+_NMAP_XML_HTTP_HEADERS = """<?xml version="1.0" encoding="UTF-8"?>
+<nmaprun scanner="nmap" args="nmap -sV --open -T4 -Pn 10.0.3.4">
+  <host>
+    <address addr="10.0.3.4" addrtype="ipv4"/>
+    <hostnames/>
+    <ports>
+      <port protocol="tcp" portid="80">
+        <state state="open"/>
+        <service name="http" product="Apache" version="2.4.50"/>
+        <script id="http-headers" output="X-Powered-By: PHP/7.2.0&#10;Server: Apache/2.4.50"/>
+      </port>
+    </ports>
+  </host>
+</nmaprun>
+"""
+
+
+def test_parse_nmap_ftp_anon_evidence_enriched():
+    """ftp-anon port-level script output is appended to evidence; shape stable."""
+    findings = parse_nmap(_NMAP_XML_FTP_ANON)
+    assert len(findings) == 1
+    f = findings[0]
+    assert f["port"] == 21
+    assert "ftp-anon" in f["evidence"], f"evidence: {f['evidence']!r}"
+    assert "Anonymous FTP login allowed" in f["evidence"]
+    # Shape stable — no new top-level keys.
+    allowed = {
+        "host", "hostname", "port", "protocol", "severity",
+        "cvss_score", "cve_id", "cve_ids", "nvt_oid", "detector_signature",
+        "title", "description", "solution", "evidence", "references",
+    }
+    assert set(f.keys()) - allowed == set()
+
+
+def test_parse_nmap_ssl_cert_evidence_enriched():
+    """ssl-cert port-level script output is appended to evidence."""
+    findings = parse_nmap(_NMAP_XML_SSL_CERT)
+    assert len(findings) == 1
+    f = findings[0]
+    assert f["port"] == 443
+    assert "ssl-cert" in f["evidence"]
+    assert "CN=example.com" in f["evidence"]
+
+
+def test_parse_nmap_smb2_security_mode_evidence_enriched():
+    """smb2-security-mode script output (signing not required) appended to evidence."""
+    findings = parse_nmap(_NMAP_XML_SMB2_MODE)
+    assert len(findings) == 1
+    f = findings[0]
+    assert f["port"] == 445
+    assert "smb2-security-mode" in f["evidence"]
+    assert "signing enabled but not required" in f["evidence"]
+
+
+def test_parse_nmap_http_headers_newline_stripped_from_evidence():
+    """http-headers output with embedded newlines is sanitized to a single line."""
+    findings = parse_nmap(_NMAP_XML_HTTP_HEADERS)
+    assert len(findings) == 1
+    f = findings[0]
+    assert "http-headers" in f["evidence"]
+    # Evidence must be a single line — no newlines injected by the script output.
+    assert "\n" not in f["evidence"]
+    assert "\r" not in f["evidence"]
+
+
+def test_parse_nmap_host_level_script_applied_to_all_ports():
+    """A host-level script (in hostscript) is applied to every open-port finding."""
+    xml = """<?xml version="1.0" encoding="UTF-8"?>
+<nmaprun scanner="nmap" args="nmap -sV --open 10.0.3.5">
+  <host>
+    <address addr="10.0.3.5" addrtype="ipv4"/>
+    <hostnames/>
+    <ports>
+      <port protocol="tcp" portid="22">
+        <state state="open"/>
+        <service name="ssh" product="OpenSSH" version="8.0"/>
+      </port>
+      <port protocol="tcp" portid="80">
+        <state state="open"/>
+        <service name="http" product="nginx" version="1.20"/>
+      </port>
+    </ports>
+    <hostscript>
+      <script id="smb2-security-mode" output="2.02: Message signing enabled but not required"/>
+    </hostscript>
+  </host>
+</nmaprun>
+"""
+    findings = parse_nmap(xml)
+    assert len(findings) == 2
+    for f in findings:
+        assert "smb2-security-mode" in f["evidence"], (
+            f"host-level script missing from port {f['port']} evidence"
+        )
+
+
+def test_parse_nmap_unlisted_script_ignored():
+    """A script NOT in _NSE_SCRIPTS is silently ignored (allowlist gate)."""
+    xml = """<?xml version="1.0" encoding="UTF-8"?>
+<nmaprun scanner="nmap" args="nmap -sV --open 10.0.3.6">
+  <host>
+    <address addr="10.0.3.6" addrtype="ipv4"/>
+    <hostnames/>
+    <ports>
+      <port protocol="tcp" portid="80">
+        <state state="open"/>
+        <service name="http" product="Apache" version="2.4"/>
+        <script id="vulners" output="CVE-2021-41773: 7.5"/>
+        <script id="http-headers" output="X-Content-Type-Options: nosniff"/>
+      </port>
+    </ports>
+  </host>
+</nmaprun>
+"""
+    findings = parse_nmap(xml)
+    assert len(findings) == 1
+    f = findings[0]
+    # "vulners" is NOT in _NSE_SCRIPTS — its output must NOT appear.
+    assert "vulners" not in f["evidence"]
+    # "http-headers" IS in _NSE_SCRIPTS — it must appear.
+    assert "http-headers" in f["evidence"]
+
+
+def test_parse_nmap_finding_payload_shape_stable_with_scripts():
+    """parse_nmap still emits only FindingPayload-allowed keys when scripts present."""
+    allowed = {
+        "host", "hostname", "port", "protocol", "severity",
+        "cvss_score", "cve_id", "cve_ids", "nvt_oid", "detector_signature",
+        "title", "description", "solution", "evidence", "references",
+    }
+    # Use the FTP fixture which adds a port-level script.
+    findings = parse_nmap(_NMAP_XML_FTP_ANON)
+    assert findings
+    for f in findings:
+        extra = set(f.keys()) - allowed
+        assert extra == set(), f"emits keys outside FindingPayload: {extra}"
+
+
+# ---------------------------------------------------------------------------
+# CVE offline catch (§51 — no external calls)
+# ---------------------------------------------------------------------------
+
+_NMAP_XML_CVE_IN_SCRIPT = """<?xml version="1.0" encoding="UTF-8"?>
+<nmaprun scanner="nmap" args="nmap -sV --open 10.0.4.1">
+  <host>
+    <address addr="10.0.4.1" addrtype="ipv4"/>
+    <hostnames/>
+    <ports>
+      <port protocol="tcp" portid="443">
+        <state state="open"/>
+        <service name="https" product="nginx" version="1.14.0"/>
+        <script id="ssl-cert" output="Weak key: CVE-2008-0166 RSA key generated by Debian OpenSSL"/>
+      </port>
+    </ports>
+  </host>
+</nmaprun>
+"""
+
+_NMAP_XML_NO_CVE = """<?xml version="1.0" encoding="UTF-8"?>
+<nmaprun scanner="nmap" args="nmap -sV --open 10.0.4.2">
+  <host>
+    <address addr="10.0.4.2" addrtype="ipv4"/>
+    <hostnames/>
+    <ports>
+      <port protocol="tcp" portid="21">
+        <state state="open"/>
+        <service name="ftp" product="vsftpd" version="3.0.3"/>
+        <script id="ftp-anon" output="Anonymous FTP login allowed (FTP code 230)"/>
+      </port>
+    </ports>
+  </host>
+</nmaprun>
+"""
+
+
+def test_parse_nmap_cve_from_script_output_captured():
+    """A CVE referenced in safe script output is captured in cve_ids/cve_id."""
+    findings = parse_nmap(_NMAP_XML_CVE_IN_SCRIPT)
+    assert len(findings) == 1
+    f = findings[0]
+    assert "cve_ids" in f, "cve_ids should be set when script output contains a CVE"
+    assert "CVE-2008-0166" in f["cve_ids"]
+    assert f["cve_id"] == "CVE-2008-0166"
+
+
+def test_parse_nmap_no_cve_no_field():
+    """When no CVE appears in script output, cve_id/cve_ids are absent (§50)."""
+    findings = parse_nmap(_NMAP_XML_NO_CVE)
+    assert len(findings) == 1
+    f = findings[0]
+    assert "cve_ids" not in f
+    assert "cve_id" not in f
+
+
+def test_parse_nmap_cve_cap_enforced():
+    """More than _CVE_CAP CVEs in script output are capped (attacker-controlled)."""
+    # Build a script output with 30 fake CVE IDs (well above the cap of 10).
+    cve_list = " ".join(f"CVE-2024-{i:05d}" for i in range(1, 31))
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<nmaprun scanner="nmap" args="nmap -sV --open 10.0.4.3">
+  <host>
+    <address addr="10.0.4.3" addrtype="ipv4"/>
+    <hostnames/>
+    <ports>
+      <port protocol="tcp" portid="443">
+        <state state="open"/>
+        <service name="https" product="nginx" version="1.25.0"/>
+        <script id="ssl-cert" output="{cve_list}"/>
+      </port>
+    </ports>
+  </host>
+</nmaprun>
+"""
+    findings = parse_nmap(xml)
+    assert len(findings) == 1
+    f = findings[0]
+    assert "cve_ids" in f
+    assert len(f["cve_ids"]) <= scanner._CVE_CAP, (
+        f"CVE cap not enforced: got {len(f['cve_ids'])} IDs"
+    )
+
+
+def test_parse_nmap_cve_ids_deduplicated():
+    """Duplicate CVE IDs from multiple scripts are deduplicated."""
+    xml = """<?xml version="1.0" encoding="UTF-8"?>
+<nmaprun scanner="nmap" args="nmap -sV --open 10.0.4.4">
+  <host>
+    <address addr="10.0.4.4" addrtype="ipv4"/>
+    <hostnames/>
+    <ports>
+      <port protocol="tcp" portid="443">
+        <state state="open"/>
+        <service name="https" product="nginx" version="1.25.0"/>
+        <script id="ssl-cert" output="CVE-2008-0166 repeated CVE-2008-0166"/>
+        <script id="http-headers" output="See also CVE-2008-0166"/>
+      </port>
+    </ports>
+  </host>
+</nmaprun>
+"""
+    findings = parse_nmap(xml)
+    assert len(findings) == 1
+    f = findings[0]
+    assert "cve_ids" in f
+    assert f["cve_ids"].count("CVE-2008-0166") == 1, "CVE IDs must be deduplicated"
+
+
+# ---------------------------------------------------------------------------
+# Sanitization of attacker-controlled script output
+# ---------------------------------------------------------------------------
+
+def test_sanitize_script_output_strips_control_chars():
+    """_sanitize_script_output strips control chars/newlines from attacker output."""
+    evil = "normal\x00text\ninjected_line\r\x1bESC\x7f"
+    result = scanner._sanitize_script_output(evil)
+    assert result is not None
+    assert "\n" not in result
+    assert "\r" not in result
+    assert "\x00" not in result
+    assert "\x1b" not in result
+    assert "\x7f" not in result
+    assert "normaltext" in result
+
+
+def test_sanitize_script_output_caps_length():
+    """_sanitize_script_output caps at _SCRIPT_OUTPUT_MAX characters."""
+    long_output = "A" * 5000
+    result = scanner._sanitize_script_output(long_output)
+    assert result is not None
+    assert len(result) <= scanner._SCRIPT_OUTPUT_MAX
+
+
+def test_sanitize_script_output_empty_returns_none():
+    """All-control-char or empty input returns None."""
+    assert scanner._sanitize_script_output("") is None
+    assert scanner._sanitize_script_output(None) is None
+    assert scanner._sanitize_script_output("\x00\x01\x1f\x7f") is None
+    assert scanner._sanitize_script_output("   ") is None
+
+
+def test_parse_nmap_script_output_attacker_controlled_sanitized():
+    """Evidence from a hostile script output has no control chars + is bounded.
+
+    XML 1.0 only allows TAB (&#9;), LF (&#10;), CR (&#13;) and \\x7f (DEL is
+    NOT a restricted char in attribute values but IS in nmap output) as the
+    whitespace / newline injection vectors that actually reach parse_nmap via
+    the XML layer — the same approach as the existing smb-fields sanitization
+    test.  C0 bytes other than TAB/LF/CR are invalid in XML 1.0 and are
+    rejected by the parser before our code sees them; we therefore test only
+    the chars that DO reach us and that our sanitizer must strip.
+    """
+    # Use XML entity references for the XML-valid control chars that ARE the
+    # real injection surface: TAB (\t), LF (\n), CR (\r), DEL (\x7f).
+    # We embed them in the output attribute value via XML numeric references.
+    evil_output_xml = (
+        "safe_prefix&#9;tab&#10;INJECTED_LINE&#13;cr&#127;del" + "X" * 5000
+    )
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<nmaprun scanner="nmap" args="nmap -sV --open 10.0.5.1">
+  <host>
+    <address addr="10.0.5.1" addrtype="ipv4"/>
+    <hostnames/>
+    <ports>
+      <port protocol="tcp" portid="21">
+        <state state="open"/>
+        <service name="ftp" product="vsftpd" version="3.0.3"/>
+        <script id="ftp-anon" output="{evil_output_xml}"/>
+      </port>
+    </ports>
+  </host>
+</nmaprun>
+"""
+    findings = parse_nmap(xml)
+    assert len(findings) == 1, "XML should be valid and produce one finding"
+    f = findings[0]
+    ev = f["evidence"]
+    # Sanitizer strips TAB/LF/CR/DEL — none may appear in the evidence string.
+    assert "\n" not in ev
+    assert "\r" not in ev
+    assert "\t" not in ev
+    assert "\x7f" not in ev
+    # Total evidence is bounded (base evidence + capped script contribution).
+    assert len(ev) < 1000, f"evidence too long: {len(ev)}"
+    # "ftp-anon" label still present in evidence.
+    assert "ftp-anon" in ev
+
+
+# ---------------------------------------------------------------------------
+# filter_scope unchanged (regression guard)
+# ---------------------------------------------------------------------------
+
+def test_filter_scope_still_fails_closed_after_nse_deepening():
+    """filter_scope is unchanged: cidrs_allowed=None still returns [] after v0.4.0."""
+    assert filter_scope("10.0.0.5", None) == []
+    assert filter_scope("10.0.0.5", ["10.0.0.0/24"]) == ["10.0.0.5/32"]
+    assert filter_scope("8.8.8.8", ["10.0.0.0/24"]) == []
+    assert filter_scope("10.0.0.5", []) == ["10.0.0.5/32"]
