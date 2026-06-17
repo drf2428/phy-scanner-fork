@@ -717,3 +717,42 @@ def test_run_scan_cidrs_none_fails_closed_no_nmap(monkeypatch):
     assert result.findings == []
     assert result.kept_targets == []
     assert result.dropped_targets == ["10.0.0.5"]
+
+
+# Fixture: REAL nmap smb-os-discovery output (verified E2E vs Samba, 2026-06-17).
+# Real nmap uses LOWERCASE <elem key="server"|"os">; the NetBIOS name is NUL-padded
+# and rendered as the literal escape "\x00"; the "Computer name:"/"OS:" labels live
+# only in the `output` attribute. This pins the ACTUAL format (the original fixture
+# used assumed keys "Computer Name"/"OS" that real nmap never emits).
+_NMAP_XML_SMB_REAL = """<?xml version="1.0"?>
+<nmaprun scanner="nmap" args="nmap -sV --script=smb-os-discovery 172.20.0.2">
+  <host>
+    <address addr="172.20.0.2" addrtype="ipv4"/>
+    <ports>
+      <port protocol="tcp" portid="445"><state state="open"/>
+        <service name="microsoft-ds" product="Samba smbd" version="4.12.2"/>
+      </port>
+    </ports>
+    <hostscript>
+      <script id="smb-os-discovery" output="&#10;  OS: Windows 6.1 (Samba 4.12.2)&#10;  Computer name: box123&#10;  NetBIOS computer name: DC01LAB\\x00&#10;">
+        <elem key="os">Windows 6.1</elem>
+        <elem key="lanmanager">Samba 4.12.2</elem>
+        <elem key="server">DC01LAB\\x00</elem>
+        <elem key="fqdn">box123</elem>
+      </script>
+    </hostscript>
+  </host>
+</nmaprun>"""
+
+
+def test_parse_nmap_smb_real_format_server_elem_and_nul_stripped():
+    """Real nmap emits lowercase key='server' (NetBIOS name, NUL-padded as literal
+    '\\x00') + key='os' — NOT 'Computer Name'/'OS'. parse_nmap must read the real
+    keys and strip the '\\x00' artifact from the hostname."""
+    findings = parse_nmap(_NMAP_XML_SMB_REAL)
+    assert findings, "expected at least one finding"
+    f = findings[0]
+    hn = f["hostname"] if isinstance(f, dict) else f.hostname
+    ev = f["evidence"] if isinstance(f, dict) else f.evidence
+    assert hn == "DC01LAB", f"hostname should be the clean SMB Computer Name, got {hn!r}"
+    assert "Windows 6.1" in ev, f"OS should be annotated in evidence, got {ev!r}"

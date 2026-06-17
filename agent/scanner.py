@@ -249,6 +249,11 @@ def filter_scope(
 # chars + DEL (incl. NUL/newlines so nothing can inject extra lines/garbage).
 _SMB_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 
+# nmap renders non-printable bytes in <elem> text / `output` as the LITERAL
+# 4-char escape "\xNN" (NetBIOS names are NUL-padded → "DC01LAB\x00"). Strip
+# those artifacts too so the hostname/OS are clean (verified E2E vs Samba).
+_SMB_NMAP_ESCAPE = re.compile(r"\\x[0-9a-fA-F]{2}")
+
 # Hostname cap mirrors the backend column bound (hostname[:255]).
 _SMB_NAME_MAX = 255
 # OS string is annotated into evidence text only; bound it independently.
@@ -261,7 +266,8 @@ def _sanitize_smb_field(value: Optional[str], max_len: int) -> Optional[str]:
     fall back to existing behaviour rather than using an empty string)."""
     if not value:
         return None
-    cleaned = _SMB_CONTROL_CHARS.sub("", value).strip()[:max_len]
+    cleaned = _SMB_NMAP_ESCAPE.sub("", value)
+    cleaned = _SMB_CONTROL_CHARS.sub("", cleaned).strip()[:max_len]
     return cleaned or None
 
 
@@ -276,22 +282,40 @@ def _extract_smb_os_discovery(host: "ET.Element") -> tuple[Optional[str], Option
     return. A field that is empty after sanitization is returned as None so the
     caller falls back to its existing logic.
 
-    Handles both key names emitted by different nmap/script versions:
-      - ``Computer Name`` (common) or ``NetBIOS computer name`` (alternate).
-      - ``OS`` for the OS string.
+    Real nmap (verified E2E vs Samba) emits LOWERCASE structured <elem> keys:
+      - ``server`` = NetBIOS computer name (e.g. "DC01LAB\\x00")
+      - ``os``     = OS string (e.g. "Windows 6.1 (Samba 4.12.2)")
+    The human-readable labels ("Computer name:", "NetBIOS computer name:", "OS:")
+    only appear in the script's ``output`` attribute, NOT as <elem> keys. Read the
+    structured elems first (most precise), then fall back to parsing ``output``
+    (stable across nmap-version drift). Legacy/alternate keys are still accepted.
     """
     for script_el in host.findall("hostscript/script[@id='smb-os-discovery']"):
         computer_name: Optional[str] = None
         os_string: Optional[str] = None
+        # 1) Structured <elem key="...">, matched case-insensitively. Prefer the
+        #    NetBIOS name (`server`) for the hostname and `os` for the OS.
         for elem in script_el.findall("elem"):
-            key = (elem.get("key") or "").strip()
+            key = (elem.get("key") or "").strip().lower()
             val = (elem.text or "").strip()
             if not val:
                 continue
-            if key in ("Computer Name", "NetBIOS computer name"):
+            if key in ("server", "netbios computer name", "computer name") and not computer_name:
                 computer_name = val
-            elif key == "OS":
+            elif key == "os" and not os_string:
                 os_string = val
+        # 2) Fallback: parse the human-readable `output` attribute. Prefer the
+        #    NetBIOS short name over the FQDN-ish "Computer name".
+        output = script_el.get("output") or ""
+        if not computer_name:
+            m = (re.search(r"NetBIOS computer name:\s*([^\r\n]+)", output)
+                 or re.search(r"Computer name:\s*([^\r\n]+)", output))
+            if m:
+                computer_name = m.group(1)
+        if not os_string:
+            m = re.search(r"\bOS:\s*([^\r\n]+)", output)
+            if m:
+                os_string = m.group(1)
         return (
             _sanitize_smb_field(computer_name, _SMB_NAME_MAX),
             _sanitize_smb_field(os_string, _SMB_OS_MAX),
